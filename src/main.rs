@@ -1,6 +1,10 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::mpsc,
+};
 
-use inotify::{Inotify, WatchMask};
+use notify::{Event, RecursiveMode, Result, Watcher};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -16,28 +20,25 @@ struct LibConfig {
     component_serach_engine_footprints: PathBuf,
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
+    let (tx, rx) = mpsc::channel::<Result<Event>>();
+    let mut watcher = notify::recommended_watcher(tx)?;
     let downloads = PathBuf::from(env::var("HOME").unwrap()).join("Downloads");
+    watcher.watch(&downloads, RecursiveMode::Recursive)?;
 
-    println!("Watching {:?}", downloads);
-
-    let mut inotify = Inotify::init()?;
-
-    inotify.watches().add(&downloads, WatchMask::MOVED_TO)?;
-
-    let mut buffer = [0u8; 4096];
-
-    loop {
-        let events = inotify.read_events_blocking(&mut buffer)?;
-
-        for event in events {
-            if let Some(name) = event.name {
-                if let Some(name_str) = name.to_str() {
-                    if name_str.starts_with("LIB") {
-                        println!("Component Search Engine Detected");
-                    }
-                }
-            }
+    for res in rx {
+        match res {
+            Ok(event) => println!("event: {:?}", event.paths[0]),
+            Err(e) => println!("watch error: {:?}", e),
         }
     }
+
+    Ok(())
+}
+
+fn validate_lib(path: PathBuf) -> bool {
+    if path.is_file() {
+        let filename = path.file_name();
+    }
+    return false;
 }
