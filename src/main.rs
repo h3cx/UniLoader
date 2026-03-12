@@ -2,9 +2,15 @@ use std::{
     env, fs,
     path::{self, Path, PathBuf},
     sync::mpsc,
+    thread::sleep,
+    time::Duration,
 };
 
-use notify::{Event, EventKind, RecursiveMode, Watcher, event::CreateKind};
+use notify::{
+    Event, EventKind, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind},
+};
+use notify_debouncer_mini::{DebouncedEvent, new_debouncer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -65,22 +71,28 @@ fn main() -> notify::Result<()> {
             println!("{:?}", config.libraries.unwrap().symacsys_symbols.unwrap());
         }
     }
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(tx)?;
+    let (tx, rx) = mpsc::channel::<Result<Vec<DebouncedEvent>, notify::Error>>();
+
+    let mut debouncer = new_debouncer(Duration::from_secs(2), tx)?;
     let downloads = PathBuf::from(env::var("HOME").unwrap()).join("Downloads");
-    watcher.watch(&downloads, RecursiveMode::NonRecursive)?;
+    println!("{:?}", downloads);
+
+    debouncer
+        .watcher()
+        .watch(&downloads, RecursiveMode::NonRecursive)?;
 
     for res in rx {
         match res {
-            Ok(event) => {
-                if event.kind != EventKind::Create(CreateKind::File) {
-                    continue;
-                }
-                if !validate_zip(&event.paths[0]) {
+            Ok(events) => {
+                println!("{:?}", events.len());
+                let event = events[0].clone();
+                let path = event.path;
+
+                if !validate_zip(&path) {
                     continue;
                 }
 
-                let Ok(source_type) = find_source_type(&event.paths[0]) else {
+                let Ok(source_type) = find_source_type(&path) else {
                     continue;
                 };
 
