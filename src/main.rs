@@ -96,10 +96,10 @@ impl SymbolLibrary {
 
         for sym in &self.symbols {
             out.push_str(&sym.raw);
-            out.push_str("\n");
+            out.push('\n');
         }
 
-        out.push_str(")");
+        out.push(')');
         out
     }
 
