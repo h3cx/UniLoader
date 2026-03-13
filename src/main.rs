@@ -179,7 +179,12 @@ fn main() -> notify::Result<()> {
                             continue;
                         };
                     }
-                    SourceType::UltraLibrarian => println!("UltraLibrarian detected"),
+                    SourceType::UltraLibrarian => {
+                        println!("UltraLibrarian detected, Installing...");
+                        let Ok(_) = import_ultralibrarian(&event.paths[0], &config) else {
+                            continue;
+                        };
+                    }
                 }
             }
             Err(e) => println!("watch error: {:?}", e),
@@ -326,5 +331,104 @@ fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
     // Delete temporary folder
     fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
 
+    Ok(())
+}
+
+fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError> {
+    // Extract ZIP archive from downloads folder into libraries/tmp
+    let tmp_path = extract_zip(path, config)?;
+
+    // Find directory containing extracted library data
+    let data_dir = fs::read_dir(&tmp_path)
+        .map_err(|_| ImportError::InvalidPath)?
+        .filter_map(|e| e.ok())
+        .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .ok_or(ImportError::InvalidPath)?;
+
+    let pretty_dir = data_dir.join("footprints.pretty");
+
+    // Read all entries once
+    let root_entries: Vec<_> = fs::read_dir(&data_dir)
+        .map_err(|_| ImportError::InvalidPath)?
+        .filter_map(|e| e.ok())
+        .collect();
+
+    let pretty_entries: Vec<_> = fs::read_dir(&pretty_dir)
+        .map_err(|_| ImportError::InvalidPath)?
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // Collect all symbol and footprint files
+    let sym_files: Vec<PathBuf> = root_entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|e| e == "kicad_sym")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    let mod_files: Vec<PathBuf> = pretty_entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|e| e == "kicad_mod")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    if sym_files.is_empty() && mod_files.is_empty() {
+        return Err(ImportError::InvalidPath);
+    }
+
+    // Target library paths
+    let ultralibrarian_root = config.libraries.path.join("UltraLibrarian");
+    let ultralibrarian_sym = ultralibrarian_root.join("UltraLibrarian_Components.kicad_sym");
+    let ultralibrarian_pretty = ultralibrarian_root.join("UltraLibrarian_Footprints.pretty");
+
+    fs::create_dir_all(&ultralibrarian_root).map_err(|_| ImportError::InvalidPath)?;
+    fs::create_dir_all(&ultralibrarian_pretty).map_err(|_| ImportError::InvalidPath)?;
+
+    // Load or create symbol library
+    let mut current_lib = if ultralibrarian_sym.exists() {
+        let contents =
+            fs::read_to_string(&ultralibrarian_sym).map_err(|_| ImportError::InvalidPath)?;
+        SymbolLibrary::from_str(&contents)
+    } else {
+        SymbolLibrary::new()
+    };
+
+    // Import symbols from every .kicad_sym file
+    for sym_path in sym_files {
+        let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
+        let new_lib = SymbolLibrary::from_str(&sym_str);
+
+        for symbol in new_lib.symbols {
+            if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
+                current_lib.symbols.push(symbol);
+            }
+        }
+    }
+
+    // Write updated symbol library
+    let output = current_lib.write();
+    fs::write(&ultralibrarian_sym, output).map_err(|_| ImportError::InvalidPath)?;
+
+    // Copy all footprint files
+    for mod_path in mod_files {
+        let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
+        let target = ultralibrarian_pretty.join(filename);
+        fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
+    }
+
+    // Delete temporary folder
+    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
     Ok(())
 }
