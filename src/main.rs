@@ -1,12 +1,10 @@
 use std::{
     env,
     fs::{self, File},
-    ops::Not,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::mpsc,
 };
 
-use chrono::Local;
 use notify::{Event, EventKind, RecursiveMode, Watcher, event::CreateKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -237,70 +235,96 @@ fn extract_zip(path: &Path, config: &Config) -> Result<PathBuf, ImportError> {
 }
 
 fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
+    // Extract ZIP archive from downloads folder into libraries/tmp
     let tmp_path = extract_zip(path, config)?;
 
-    let dirs = fs::read_dir(&tmp_path).map_err(|_| ImportError::InvalidPath)?;
-
-    let Some(data_dir) = dirs
+    // Find directory containing extracted library data
+    let data_dir = fs::read_dir(&tmp_path)
+        .map_err(|_| ImportError::InvalidPath)?
         .filter_map(|e| e.ok())
         .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|entry| entry.path())
-    else {
-        return Err(ImportError::InvalidPath);
-    };
+        .ok_or(ImportError::InvalidPath)?;
 
+    // Locate KiCad directory
     let kicad_dir = data_dir.join("KiCad");
 
-    let results = fs::read_dir(&kicad_dir).map_err(|_| ImportError::InvalidPath)?;
-
-    let Some(sym) = results
+    // Read all entries once
+    let entries: Vec<_> = fs::read_dir(&kicad_dir)
+        .map_err(|_| ImportError::InvalidPath)?
         .filter_map(|e| e.ok())
-        .find(|entry| {
+        .collect();
+
+    // Collect all symbol and footprint files
+    let sym_files: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| {
             entry
                 .path()
                 .extension()
-                .map(|ext| ext == "kicad_sym")
+                .map(|e| e == "kicad_sym")
                 .unwrap_or(false)
         })
         .map(|entry| entry.path())
-    else {
+        .collect();
+
+    let mod_files: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|e| e == "kicad_mod")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    if sym_files.is_empty() && mod_files.is_empty() {
         return Err(ImportError::InvalidPath);
+    }
+
+    // Target library paths
+    let symacsys_root = config.libraries.path.join("SymacSys");
+    let symacsys_sym = symacsys_root.join("SymacSys_Components.kicad_sym");
+    let symacsys_pretty = symacsys_root.join("SymacSys_Footprints.pretty");
+
+    fs::create_dir_all(&symacsys_root).map_err(|_| ImportError::InvalidPath)?;
+    fs::create_dir_all(&symacsys_pretty).map_err(|_| ImportError::InvalidPath)?;
+
+    // Load or create symbol library
+    let mut current_lib = if symacsys_sym.exists() {
+        let contents = fs::read_to_string(&symacsys_sym).map_err(|_| ImportError::InvalidPath)?;
+        SymbolLibrary::from_str(&contents)
+    } else {
+        SymbolLibrary::new()
     };
 
-    let sym_str = fs::read_to_string(&sym).map_err(|_| ImportError::InvalidPath)?;
+    // Import symbols from every .kicad_sym file
+    for sym_path in sym_files {
+        let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
+        let new_lib = SymbolLibrary::from_str(&sym_str);
 
-    let new_lib = SymbolLibrary::from_str(&sym_str);
-
-    let symacsys_path = config.libraries.path.join("SymacSys");
-    let symacsys_sym = symacsys_path.join("SymacSys_Components.kicad_sym");
-
-    fs::create_dir_all(symacsys_path).map_err(|_| ImportError::InvalidPath)?;
-
-    let mut current_lib: SymbolLibrary;
-
-    if symacsys_sym.exists() {
-        let symacsys_sym_str =
-            fs::read_to_string(&symacsys_sym).map_err(|_| ImportError::InvalidPath)?;
-        current_lib = SymbolLibrary::from_str(&symacsys_sym_str);
-    } else {
-        current_lib = SymbolLibrary::new();
-        let symacsys_sym_str = current_lib.write();
-        fs::write(&symacsys_sym, symacsys_sym_str).map_err(|_| ImportError::InvalidPath)?;
+        for symbol in new_lib.symbols {
+            if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
+                current_lib.symbols.push(symbol);
+            }
+        }
     }
 
-    for symbol in new_lib.symbols {
-        current_lib.symbols.push(symbol);
+    // Write updated symbol library
+    let output = current_lib.write();
+    fs::write(&symacsys_sym, output).map_err(|_| ImportError::InvalidPath)?;
+
+    // Copy all footprint files
+    for mod_path in mod_files {
+        let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
+        let target = symacsys_pretty.join(filename);
+        fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
     }
 
-    let out_lib = current_lib.write();
-    fs::write(&symacsys_sym, out_lib).map_err(|_| ImportError::InvalidPath)?;
-
-    println!("{:?}", tmp_path);
-
-    fs::remove_dir_all(tmp_path).map_err(|_| {
-        println!("Error rmdir");
-        ImportError::InvalidPath
-    })?;
+    // Delete temporary folder
+    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
 
     Ok(())
 }
