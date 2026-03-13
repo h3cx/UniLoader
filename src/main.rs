@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -47,6 +48,7 @@ struct LibConfig {
 enum SourceType {
     SymacSys,
     UltraLibrarian,
+    SnapMagic,
 }
 
 #[derive(Error, Debug)]
@@ -185,6 +187,12 @@ fn main() -> notify::Result<()> {
                             continue;
                         };
                     }
+                    SourceType::SnapMagic => {
+                        println!("SnapMagic detected, Installing...");
+                        let Ok(_) = import_snapmagic(&event.paths[0], &config) else {
+                            continue;
+                        };
+                    }
                 }
             }
             Err(e) => println!("watch error: {:?}", e),
@@ -211,12 +219,30 @@ fn find_source_type(path: &Path) -> Result<SourceType, SourceError> {
         .ok_or(SourceError::FilenameError)?;
 
     if name.starts_with("LIB_") {
-        Ok(SourceType::SymacSys)
+        return Ok(SourceType::SymacSys);
     } else if name.starts_with("ul_") {
-        Ok(SourceType::UltraLibrarian)
-    } else {
-        Err(SourceError::SourceUnknown)
+        return Ok(SourceType::UltraLibrarian);
     }
+
+    let file = File::open(path).map_err(|_| SourceError::SourceUnknown)?;
+    let mut archive = ZipArchive::new(file).map_err(|_| SourceError::SourceUnknown)?;
+    for i in 0..archive.len() {
+        let Ok(mut file) = archive.by_index(i) else {
+            continue;
+        };
+        let name = file.name();
+
+        if name.to_lowercase().contains("how-to-import") {
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|_| SourceError::SourceUnknown)?;
+
+            if contents.to_lowercase().contains("snapeda") {
+                return Ok(SourceType::SnapMagic);
+            }
+        }
+    }
+    Err(SourceError::SourceUnknown)
 }
 
 fn extract_zip(path: &Path, config: &Config) -> Result<PathBuf, ImportError> {
@@ -240,10 +266,8 @@ fn extract_zip(path: &Path, config: &Config) -> Result<PathBuf, ImportError> {
 }
 
 fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
-    // Extract ZIP archive from downloads folder into libraries/tmp
     let tmp_path = extract_zip(path, config)?;
 
-    // Find directory containing extracted library data
     let data_dir = fs::read_dir(&tmp_path)
         .map_err(|_| ImportError::InvalidPath)?
         .filter_map(|e| e.ok())
@@ -251,16 +275,12 @@ fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
         .map(|entry| entry.path())
         .ok_or(ImportError::InvalidPath)?;
 
-    // Locate KiCad directory
     let kicad_dir = data_dir.join("KiCad");
 
-    // Read all entries once
-    let entries: Vec<_> = fs::read_dir(&kicad_dir)
-        .map_err(|_| ImportError::InvalidPath)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let entries = fs::read_dir(&kicad_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
 
-    // Collect all symbol and footprint files
     let sym_files: Vec<PathBuf> = entries
         .iter()
         .filter(|entry| {
@@ -285,60 +305,19 @@ fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
         .map(|entry| entry.path())
         .collect();
 
-    if sym_files.is_empty() && mod_files.is_empty() {
-        return Err(ImportError::InvalidPath);
-    }
+    let root = config.libraries.path.join("SymacSys");
+    let sym = root.join("SymacSys_Components.kicad_sym");
+    let pretty = root.join("SymacSys_Footprints.pretty");
 
-    // Target library paths
-    let symacsys_root = config.libraries.path.join("SymacSys");
-    let symacsys_sym = symacsys_root.join("SymacSys_Components.kicad_sym");
-    let symacsys_pretty = symacsys_root.join("SymacSys_Footprints.pretty");
+    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
 
-    fs::create_dir_all(&symacsys_root).map_err(|_| ImportError::InvalidPath)?;
-    fs::create_dir_all(&symacsys_pretty).map_err(|_| ImportError::InvalidPath)?;
-
-    // Load or create symbol library
-    let mut current_lib = if symacsys_sym.exists() {
-        let contents = fs::read_to_string(&symacsys_sym).map_err(|_| ImportError::InvalidPath)?;
-        SymbolLibrary::from_str(&contents)
-    } else {
-        SymbolLibrary::new()
-    };
-
-    // Import symbols from every .kicad_sym file
-    for sym_path in sym_files {
-        let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
-        let new_lib = SymbolLibrary::from_str(&sym_str);
-
-        for symbol in new_lib.symbols {
-            if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
-                current_lib.symbols.push(symbol);
-            }
-        }
-    }
-
-    // Write updated symbol library
-    let output = current_lib.write();
-    fs::write(&symacsys_sym, output).map_err(|_| ImportError::InvalidPath)?;
-
-    // Copy all footprint files
-    for mod_path in mod_files {
-        let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
-        let target = symacsys_pretty.join(filename);
-        fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
-    }
-
-    // Delete temporary folder
     fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
-
     Ok(())
 }
 
 fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError> {
-    // Extract ZIP archive from downloads folder into libraries/tmp
     let tmp_path = extract_zip(path, config)?;
 
-    // Find directory containing extracted library data
     let data_dir = fs::read_dir(&tmp_path)
         .map_err(|_| ImportError::InvalidPath)?
         .filter_map(|e| e.ok())
@@ -348,18 +327,14 @@ fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError
 
     let pretty_dir = data_dir.join("footprints.pretty");
 
-    // Read all entries once
-    let root_entries: Vec<_> = fs::read_dir(&data_dir)
-        .map_err(|_| ImportError::InvalidPath)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let root_entries = fs::read_dir(&data_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
 
-    let pretty_entries: Vec<_> = fs::read_dir(&pretty_dir)
-        .map_err(|_| ImportError::InvalidPath)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let pretty_entries = fs::read_dir(&pretty_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
 
-    // Collect all symbol and footprint files
     let sym_files: Vec<PathBuf> = root_entries
         .iter()
         .filter(|entry| {
@@ -384,28 +359,76 @@ fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError
         .map(|entry| entry.path())
         .collect();
 
-    if sym_files.is_empty() && mod_files.is_empty() {
-        return Err(ImportError::InvalidPath);
-    }
+    let root = config.libraries.path.join("UltraLibrarian");
+    let sym = root.join("UltraLibrarian_Components.kicad_sym");
+    let pretty = root.join("UltraLibrarian_Footprints.pretty");
 
-    // Target library paths
-    let ultralibrarian_root = config.libraries.path.join("UltraLibrarian");
-    let ultralibrarian_sym = ultralibrarian_root.join("UltraLibrarian_Components.kicad_sym");
-    let ultralibrarian_pretty = ultralibrarian_root.join("UltraLibrarian_Footprints.pretty");
+    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
 
-    fs::create_dir_all(&ultralibrarian_root).map_err(|_| ImportError::InvalidPath)?;
-    fs::create_dir_all(&ultralibrarian_pretty).map_err(|_| ImportError::InvalidPath)?;
+    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
+    Ok(())
+}
+
+fn import_snapmagic(path: &Path, config: &Config) -> Result<(), ImportError> {
+    let data_dir = extract_zip(path, config)?;
+
+    let entries = fs::read_dir(&data_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let sym_files: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|e| e == "kicad_sym")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    let mod_files: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|e| e == "kicad_mod")
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    let root = config.libraries.path.join("SnapMagic");
+    let sym = root.join("SnapMagic_components.kicad_sym");
+    let pretty = root.join("SnapMagic_Footprints.pretty");
+
+    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
+
+    fs::remove_dir_all(data_dir).map_err(|_| ImportError::InvalidPath)?;
+    Ok(())
+}
+
+fn install_library(
+    sym_files: Vec<PathBuf>,
+    mod_files: Vec<PathBuf>,
+    lib_root: &Path,
+    sym_file: &Path,
+    pretty_dir: &Path,
+) -> Result<(), ImportError> {
+    fs::create_dir_all(lib_root).map_err(|_| ImportError::InvalidPath)?;
+    fs::create_dir_all(pretty_dir).map_err(|_| ImportError::InvalidPath)?;
 
     // Load or create symbol library
-    let mut current_lib = if ultralibrarian_sym.exists() {
-        let contents =
-            fs::read_to_string(&ultralibrarian_sym).map_err(|_| ImportError::InvalidPath)?;
+    let mut current_lib = if sym_file.exists() {
+        let contents = fs::read_to_string(sym_file).map_err(|_| ImportError::InvalidPath)?;
         SymbolLibrary::from_str(&contents)
     } else {
         SymbolLibrary::new()
     };
 
-    // Import symbols from every .kicad_sym file
+    // Install symbols
     for sym_path in sym_files {
         let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
         let new_lib = SymbolLibrary::from_str(&sym_str);
@@ -417,18 +440,17 @@ fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError
         }
     }
 
-    // Write updated symbol library
-    let output = current_lib.write();
-    fs::write(&ultralibrarian_sym, output).map_err(|_| ImportError::InvalidPath)?;
+    if !current_lib.symbols.is_empty() {
+        let output = current_lib.write();
+        fs::write(sym_file, output).map_err(|_| ImportError::InvalidPath)?;
+    }
 
-    // Copy all footprint files
+    // Install footprints
     for mod_path in mod_files {
         let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
-        let target = ultralibrarian_pretty.join(filename);
+        let target = pretty_dir.join(filename);
         fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
     }
 
-    // Delete temporary folder
-    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
     Ok(())
 }
