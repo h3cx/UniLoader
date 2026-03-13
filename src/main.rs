@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Hector van der Aa <hector@h3cx.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
 use std::{
     env,
     fs::{self, File},
