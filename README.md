@@ -4,34 +4,28 @@ A simple daemon that automatically imports any libraries into KiCad. It currentl
 
 ## Installation
 
-An automated install script is planned but currently the repo needs to be cloned, built and installed manually
+An automated install script is planned but currently the repo needs to be cloned, built and installed manually.
 ```
-
 git clone https://git.h3cx.dev/h3cx/UniLoader.git
 
 cd UniLoader
 
 cargo build -r
-
 ```
-You will then find the binary under `target/release` you can run it manually or create a systemd service to automatically run it at boot
+You will then find the binary under `target/release` you can run it manually or create a systemd service to automatically run it at boot.
 
 ## Usage
 
-To get started you will need to set up your config, to do so create a config file
+To get started you will need to set up your config, to do so create a config file. A full config file can be found in the config folder of this repo.
 ```
-
 mkdir ~/.config/uniloader
 
 touch ~/.config/uniloader/config.toml
-
 ```
-Then use your favorite text editor to open this config and paste in the minimal config
+Then use your favorite text editor to open this config and paste in the minimal config.
 ```
-
 [libraries]
 path = "~/KiCad/libraries/"
-
 ```
 Now that you have set this up, the application should be ready to go, just head over to your favorite library website and download any component.
 

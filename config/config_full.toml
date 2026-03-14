@@ -1,0 +1,8 @@
+[libraries]
+path = "/home/hector/KiCad/libraries/"
+
+[options]
+# Selectively enable and disable the importing of footprints and symbols
+# symbols=true
+# footprints=false
+
