@@ -16,6 +16,7 @@ use zip::ZipArchive;
 #[derive(Debug, Deserialize, Serialize)]
 struct Config {
     libraries: LibConfig,
+    options: Option<OptionsConfig>,
 }
 
 impl Config {
@@ -34,6 +35,7 @@ impl Config {
                 libraries: LibConfig {
                     path: PathBuf::from("~/KiCad/libraries/"),
                 },
+                options: None,
             };
             let contents = toml::to_string_pretty(&config).map_err(|_| ConfigError::ConfigErr)?;
             fs::write(&config_path, contents).map_err(|_| ConfigError::ConfigErr)?;
@@ -45,6 +47,12 @@ impl Config {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct LibConfig {
     path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct OptionsConfig {
+    symbols: Option<bool>,
+    footprints: Option<bool>,
 }
 
 enum SourceType {
@@ -311,7 +319,7 @@ fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
     let sym = root.join("SymacSys_Components.kicad_sym");
     let pretty = root.join("SymacSys_Footprints.pretty");
 
-    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
+    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
 
     fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
     Ok(())
@@ -365,7 +373,7 @@ fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError
     let sym = root.join("UltraLibrarian_Components.kicad_sym");
     let pretty = root.join("UltraLibrarian_Footprints.pretty");
 
-    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
+    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
 
     fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
     Ok(())
@@ -406,7 +414,7 @@ fn import_snapmagic(path: &Path, config: &Config) -> Result<(), ImportError> {
     let sym = root.join("SnapMagic_components.kicad_sym");
     let pretty = root.join("SnapMagic_Footprints.pretty");
 
-    install_library(sym_files, mod_files, &root, &sym, &pretty)?;
+    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
 
     fs::remove_dir_all(data_dir).map_err(|_| ImportError::InvalidPath)?;
     Ok(())
@@ -418,40 +426,56 @@ fn install_library(
     lib_root: &Path,
     sym_file: &Path,
     pretty_dir: &Path,
+    config: &Config,
 ) -> Result<(), ImportError> {
+    let symbols = config
+        .options
+        .as_ref()
+        .and_then(|o| o.symbols)
+        .unwrap_or(true);
+    let footprints = config
+        .options
+        .as_ref()
+        .and_then(|o| o.footprints)
+        .unwrap_or(true);
+
     fs::create_dir_all(lib_root).map_err(|_| ImportError::InvalidPath)?;
     fs::create_dir_all(pretty_dir).map_err(|_| ImportError::InvalidPath)?;
 
-    // Load or create symbol library
-    let mut current_lib = if sym_file.exists() {
-        let contents = fs::read_to_string(sym_file).map_err(|_| ImportError::InvalidPath)?;
-        SymbolLibrary::from_str(&contents)
-    } else {
-        SymbolLibrary::new()
-    };
+    if symbols {
+        // Load or create symbol library
+        let mut current_lib = if sym_file.exists() {
+            let contents = fs::read_to_string(sym_file).map_err(|_| ImportError::InvalidPath)?;
+            SymbolLibrary::from_str(&contents)
+        } else {
+            SymbolLibrary::new()
+        };
 
-    // Install symbols
-    for sym_path in sym_files {
-        let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
-        let new_lib = SymbolLibrary::from_str(&sym_str);
+        // Install symbols
+        for sym_path in sym_files {
+            let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
+            let new_lib = SymbolLibrary::from_str(&sym_str);
 
-        for symbol in new_lib.symbols {
-            if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
-                current_lib.symbols.push(symbol);
+            for symbol in new_lib.symbols {
+                if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
+                    current_lib.symbols.push(symbol);
+                }
             }
+        }
+
+        if !current_lib.symbols.is_empty() {
+            let output = current_lib.write();
+            fs::write(sym_file, output).map_err(|_| ImportError::InvalidPath)?;
         }
     }
 
-    if !current_lib.symbols.is_empty() {
-        let output = current_lib.write();
-        fs::write(sym_file, output).map_err(|_| ImportError::InvalidPath)?;
-    }
-
-    // Install footprints
-    for mod_path in mod_files {
-        let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
-        let target = pretty_dir.join(filename);
-        fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
+    if footprints {
+        // Install footprints
+        for mod_path in mod_files {
+            let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
+            let target = pretty_dir.join(filename);
+            fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
+        }
     }
 
     Ok(())
