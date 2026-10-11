@@ -1,8 +1,59 @@
+# All active values below match the defaults. Paths accept ~ and ~/ prefixes.
+# Relative paths resolve from the process working directory: prefer absolute or
+# home-relative paths when running the systemd user service.
+
 [libraries]
-path = "/home/hector/KiCad/libraries/"
+# Existing provider libraries under this root are included in footprint search.
+path = "~/KiCad/libraries"
+# Select your actual installed KiCad configuration/version directory for global
+# table registration when automatic detection finds none or multiple versions.
+# kicad_config = "~/.config/kicad/9.0"
+# Extra recursive footprint/model search roots. Only add existing relevant dirs.
+search_paths = []
+model_search_paths = []
+# search_paths = ["~/KiCad/other-libraries"]
+# model_search_paths = ["~/KiCad/models"]
+
+[libraries.variables]
+# Optional KiCad path variables, used before environment values. Match the
+# variable names/version in your libraries and use actual absolute paths.
+# KICAD9_3DMODEL_DIR = "/usr/share/kicad/3dmodels"
+# MY_COMPONENT_MODELS = "/absolute/path/to/models"
 
 [options]
-# Selectively enable and disable the importing of footprints and symbols
-# symbols=true
-# footprints=false
+symbols = true
+footprints = true
+models = true
+# Keep downloaded ZIPs after successful import.
+preserve_source = true
 
+[watch]
+directories = ["~/Downloads"]
+# Require stable metadata, then validate ZIP contents. Invalid downloads retry
+# for retry_seconds; keep retry_seconds >= settle_seconds.
+settle_seconds = 2
+retry_seconds = 60
+
+[destination]
+# ask: show Project/Global/Browse; global: fixed global storage;
+# project: fixed project file, requiring project below.
+policy = "ask"
+# project = "~/projects/Board/Board.kicad_pro"
+# Copy selected external footprints/models into project storage.
+portable = true
+
+[matching]
+enabled = true
+# reuse: automatically reuse conservative exact matches; ask: review matches.
+exact = "reuse"
+# ask: comparison dialog or pending; separate: import separately; skip: skip
+# components needing comparison. None of these silently overwrites a footprint.
+ambiguous = "ask"
+# Geometric similarity tolerance in millimetres.
+tolerance = 0.15
+
+[ui]
+# Native Rust dialogs require a graphical session and working OpenGL; Browse
+# uses the XDG desktop portal. With false, choices stay pending unless an
+# explicit destination/ambiguity policy resolves them.
+enabled = true

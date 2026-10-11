@@ -1,482 +1,377 @@
 // Copyright (C) 2026 Hector van der Aa <hector@h3cx.dev>
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod config;
+mod desktop;
+mod destination;
+mod gui;
+mod importer;
+mod matching;
+mod models;
+mod preview;
+mod sexpr;
+mod sources;
+mod storage;
+mod symbols;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use config::Config;
+use importer::{Request, Session};
+use notify::{RecursiveMode, Watcher};
 use std::{
-    env,
-    fs::{self, File},
-    io::Read,
+    collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::mpsc,
+    time::{Duration, Instant, SystemTime},
 };
+use storage::Record;
 
-use notify::{Event, EventKind, RecursiveMode, Watcher, event::CreateKind};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use zip::ZipArchive;
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Config {
-    libraries: LibConfig,
-    options: Option<OptionsConfig>,
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Import downloaded KiCad components into global or portable project libraries"
+)]
+struct Cli {
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(long, global = true)]
+    noninteractive: bool,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+#[derive(Subcommand)]
+enum Commands {
+    // Isolate the native event loop on its own main thread while the watcher
+    // continues receiving downloads. This is the same executable, not a helper.
+    #[command(name = "__dialog", hide = true)]
+    Dialog,
+    /// Watch configured download directories (also the default command).
+    Watch,
+    /// Import a ZIP archive or extracted component directory.
+    Import {
+        source: PathBuf,
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// List pending and failed imports; use --all for full history.
+    Pending {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Retry an import listed by pending.
+    Retry {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show project suggestions from running KiCad processes.
+    Discover,
 }
 
-impl Config {
-    fn load_or_create() -> Result<Self, ConfigError> {
-        let config_path =
-            PathBuf::from(env::var("HOME").unwrap()).join(".config/uniloader/config.toml");
-
-        if config_path.exists() {
-            let contents = fs::read_to_string(&config_path).map_err(|_| ConfigError::ConfigErr)?;
-            let config: Config = toml::from_str(&contents).map_err(|_| ConfigError::ConfigErr)?;
-            Ok(config)
+fn execute(cfg: &Config, req: &Request, mut record: Record, session: &mut Session) -> Result<()> {
+    match importer::run(cfg, req, &mut record, session) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = format!("{error:#}");
+            if message.contains("another UniLoader import is active") {
+                return Err(error);
+            }
+            record.status = if message.contains("pending:") {
+                "pending"
+            } else if message.contains("skipped:") {
+                "skipped"
+            } else {
+                "failed"
+            }
+            .into();
+            record.message = message.clone();
+            if !req.dry_run {
+                record.save()?;
+            }
+            bail!(
+                "{}: {message} (import {}; retry with `uniloader retry {}`)",
+                record.source.display(),
+                record.id,
+                record.id
+            )
+        }
+    }
+}
+fn new_record(source: PathBuf, req: &Request) -> Result<Record> {
+    let source = fs::canonicalize(source)?;
+    let hash = storage::source_hash(&source)?;
+    let mut record = Record::new(source, hash);
+    if req.global || req.project.is_some() {
+        let target = if req.global {
+            "global".to_owned()
         } else {
-            fs::create_dir_all(config_path.parent().unwrap())
-                .map_err(|_| ConfigError::ConfigErr)?;
-            let config = Config {
-                libraries: LibConfig {
-                    path: PathBuf::from("~/KiCad/libraries/"),
-                },
-                options: None,
-            };
-            let contents = toml::to_string_pretty(&config).map_err(|_| ConfigError::ConfigErr)?;
-            fs::write(&config_path, contents).map_err(|_| ConfigError::ConfigErr)?;
-            Ok(config)
+            config::expand(req.project.as_ref().unwrap())
+                .to_string_lossy()
+                .into_owned()
+        };
+        record.id = format!("{}-{}", record.id, &storage::hash(target.as_bytes())[..8]);
+    }
+    Ok(record)
+}
+struct Waiting {
+    size: u64,
+    modified: Option<SystemTime>,
+    changed: Instant,
+    first: Instant,
+}
+fn zip_file(p: &Path) -> bool {
+    p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+fn complete_zip(p: &Path) -> Result<bool> {
+    let mut zip = zip::ZipArchive::new(fs::File::open(p)?)?;
+    let mut supported = false;
+    for i in 0..zip.len() {
+        let f = zip.by_index(i)?;
+        let name = f.name().to_ascii_lowercase();
+        if name.ends_with(".kicad_sym") || name.ends_with(".kicad_mod") {
+            supported = true;
         }
     }
+    Ok(supported)
 }
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct LibConfig {
-    path: PathBuf,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct OptionsConfig {
-    symbols: Option<bool>,
-    footprints: Option<bool>,
-}
-
-enum SourceType {
-    SymacSys,
-    UltraLibrarian,
-    SnapMagic,
-}
-
-#[derive(Error, Debug)]
-enum ConfigError {
-    #[error("Config error")]
-    ConfigErr,
-}
-
-#[derive(Error, Debug)]
-enum SourceError {
-    #[error("Unknown Source")]
-    SourceUnknown,
-    #[error("Filename Error")]
-    FilenameError,
-}
-
-#[derive(Error, Debug)]
-enum ImportError {
-    #[error("Unknown Path")]
-    InvalidPath,
-    #[error("Corrputed Zip")]
-    InvalidZip,
-}
-
-struct SymbolLibrary {
-    version: String,
-    symbols: Vec<Symbol>,
-}
-
-struct Symbol {
-    name: String,
-    raw: String,
-}
-
-impl SymbolLibrary {
-    fn new() -> Self {
-        SymbolLibrary {
-            version: "20211014".to_string(),
-            symbols: Vec::new(),
+fn watch(cfg: Config, noninteractive: bool) -> Result<()> {
+    let _watch_lock = storage::Lock::watcher()?;
+    let (events_tx, events_rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(events_tx)?;
+    for dir in &cfg.watch.directories {
+        if !dir.is_dir() {
+            bail!(
+                "watch directory {} does not exist; create it or configure watch.directories",
+                dir.display()
+            );
+        }
+        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        println!("Watching {}", dir.display());
+    }
+    let (jobs_tx, jobs_rx) = mpsc::channel::<Record>();
+    let (done_tx, done_rx) = mpsc::channel::<String>();
+    let worker_cfg = cfg.clone();
+    std::thread::spawn(move || {
+        let mut session = Session::default();
+        let req = Request {
+            noninteractive,
+            ..Request::default()
+        };
+        for record in jobs_rx {
+            let id = record.id.clone();
+            if let Err(e) = execute(&worker_cfg, &req, record, &mut session) {
+                eprintln!("{e:#}");
+                desktop::notify("Import needs attention. Run uniloader pending for details.");
+            } else {
+                desktop::notify("Component import finished. See the service log for details.");
+            }
+            let _ = done_tx.send(id);
+        }
+    });
+    let mut waiting: BTreeMap<PathBuf, Waiting> = BTreeMap::new();
+    let mut submitted: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeMap<PathBuf, (u64, Option<SystemTime>)> = BTreeMap::new();
+    // A restart resumes pending choices once, without endlessly reopening closed dialogs.
+    for r in storage::records()? {
+        if ["pending", "importing"].contains(&r.status.as_str()) && r.source.exists() {
+            submitted.insert(r.id.clone());
+            jobs_tx.send(r)?;
         }
     }
-    fn write(&self) -> String {
-        let mut out = format!(
-            "(kicad_symbol_lib\n\t(version {})\n\t(generator \"uniloader\")\n",
-            self.version,
-        );
-
-        for sym in &self.symbols {
-            out.push_str(&sym.raw);
-            out.push('\n');
-        }
-
-        out.push(')');
-        out
-    }
-
-    fn from_str(input: &str) -> Self {
-        let input = input.replace("\r\n", "\n");
-        let mut version = String::new();
-        let mut symbols = Vec::new();
-
-        if let Some(v_start) = input.find("(version ") {
-            let rest = &input[v_start + 9..];
-            if let Some(v_end) = rest.find(')') {
-                version = rest[..v_end].trim().to_string();
+    let scan = |waiting: &mut BTreeMap<PathBuf, Waiting>,
+                seen: &BTreeMap<PathBuf, (u64, Option<SystemTime>)>| {
+        for dir in &cfg.watch.directories {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !zip_file(&p) {
+                        continue;
+                    }
+                    if let Ok(m) = entry.metadata() {
+                        let signature = (m.len(), m.modified().ok());
+                        if seen.get(&p) == Some(&signature) {
+                            continue;
+                        }
+                        waiting
+                            .entry(p)
+                            .and_modify(|w| {
+                                if (w.size, w.modified) != signature {
+                                    w.size = signature.0;
+                                    w.modified = signature.1;
+                                    w.changed = Instant::now();
+                                }
+                            })
+                            .or_insert(Waiting {
+                                size: signature.0,
+                                modified: signature.1,
+                                changed: Instant::now(),
+                                first: Instant::now(),
+                            });
+                    }
+                }
             }
         }
-
-        let mut i = 0;
-        let chars: Vec<char> = input.chars().collect();
-
-        while i < chars.len() {
-            if input[i..].starts_with("(symbol ") {
-                let start = i;
-                let mut depth = 0;
-
-                while i < chars.len() {
-                    if chars[i] == '(' {
-                        depth += 1;
-                    } else if chars[i] == ')' {
-                        depth -= 1;
-
-                        if depth == 0 {
-                            let end = i + 1;
-                            let raw = input[start..end].to_string();
-
-                            let name = raw.split('"').nth(1).unwrap_or("unknown").to_string();
-
-                            symbols.push(Symbol { name, raw });
-
-                            break;
+    };
+    scan(&mut waiting, &seen);
+    let mut last_scan = Instant::now();
+    loop {
+        match events_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(_)) => scan(&mut waiting, &seen),
+            Ok(Err(e)) => eprintln!("watch error: {e}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher disconnected"),
+        }
+        if last_scan.elapsed() >= Duration::from_secs(5) {
+            scan(&mut waiting, &seen);
+            last_scan = Instant::now();
+        }
+        for id in done_rx.try_iter() {
+            submitted.remove(&id);
+        }
+        let ready = waiting
+            .iter()
+            .filter(|(_, w)| w.changed.elapsed() >= Duration::from_secs(cfg.watch.settle_seconds))
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<_>>();
+        for p in ready {
+            if !p.exists() {
+                waiting.remove(&p);
+                continue;
+            }
+            match complete_zip(&p) {
+                Ok(supported) => {
+                    let w = waiting.remove(&p).unwrap();
+                    seen.insert(p.clone(), (w.size, w.modified));
+                    if !supported {
+                        continue;
+                    }
+                    let req = Request::default();
+                    match new_record(p.clone(), &req) {
+                        Ok(r) => {
+                            let history = storage::records()?;
+                            // Completed files stay ignored until --force/manual import; pending
+                            // files are resumed once at startup, not repeatedly every scan.
+                            if history
+                                .iter()
+                                .any(|old| old.hash == r.hash && old.source == r.source)
+                                || !submitted.insert(r.id.clone())
+                            {
+                                continue;
+                            }
+                            r.save()?;
+                            jobs_tx.send(r)?;
+                        }
+                        Err(e) => eprintln!("{}: {e:#}", p.display()),
+                    }
+                }
+                Err(e) => {
+                    if waiting[&p].first.elapsed() >= Duration::from_secs(cfg.watch.retry_seconds) {
+                        let w = waiting.remove(&p).unwrap();
+                        seen.insert(p.clone(), (w.size, w.modified));
+                        if let Ok(mut r) = new_record(p.clone(), &Request::default()) {
+                            r.status = "failed".into();
+                            r.message = format!("download never became a readable ZIP: {e:#}");
+                            r.save()?;
+                        }
+                        eprintln!(
+                            "{}: ZIP still unreadable after retry window: {e:#}",
+                            p.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if matches!(cli.command, Some(Commands::Dialog)) {
+        return desktop::run_internal_dialog();
+    }
+    let cfg = Config::load(cli.config.as_deref())?;
+    match cli.command.unwrap_or(Commands::Watch) {
+        Commands::Dialog => unreachable!("handled before configuration loading"),
+        Commands::Watch => watch(cfg, cli.noninteractive),
+        Commands::Import {
+            source,
+            global,
+            project,
+            dry_run,
+            force,
+        } => {
+            let req = Request {
+                global,
+                project,
+                dry_run,
+                noninteractive: cli.noninteractive,
+                force,
+            };
+            let record = new_record(source, &req)?;
+            execute(&cfg, &req, record, &mut Session::default())
+        }
+        Commands::Pending { all } => {
+            for r in storage::records()? {
+                if all || ["pending", "failed", "importing"].contains(&r.status.as_str()) {
+                    println!(
+                        "{} [{}] {}\n  {}\n  {}",
+                        r.id,
+                        r.status,
+                        r.source.display(),
+                        r.destination.as_deref().unwrap_or("destination not chosen"),
+                        r.message
+                    );
+                    if all {
+                        for p in &r.changed {
+                            println!("  Changed: {}", p.display());
+                        }
+                        for p in &r.backups {
+                            println!("  Backup: {}", p.display());
                         }
                     }
-                    i += 1;
                 }
             }
-            i += 1;
+            Ok(())
         }
-
-        Self { version, symbols }
-    }
-}
-
-fn main() -> notify::Result<()> {
-    let config = Config::load_or_create().unwrap();
-    println!("{:?}", config.libraries.path);
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(tx)?;
-    let downloads = PathBuf::from(env::var("HOME").unwrap()).join("Downloads");
-    watcher.watch(&downloads, RecursiveMode::NonRecursive)?;
-
-    for res in rx {
-        match res {
-            Ok(event) => {
-                if event.kind != EventKind::Create(CreateKind::File) {
-                    continue;
-                }
-                if !validate_zip(&event.paths[0]) {
-                    continue;
-                }
-
-                let Ok(source_type) = find_source_type(&event.paths[0]) else {
-                    continue;
-                };
-
-                match source_type {
-                    SourceType::SymacSys => {
-                        println!("SymacSys detected, Installing...");
-                        let Ok(_) = import_symacsys(&event.paths[0], &config) else {
-                            continue;
-                        };
-                    }
-                    SourceType::UltraLibrarian => {
-                        println!("UltraLibrarian detected, Installing...");
-                        let Ok(_) = import_ultralibrarian(&event.paths[0], &config) else {
-                            continue;
-                        };
-                    }
-                    SourceType::SnapMagic => {
-                        println!("SnapMagic detected, Installing...");
-                        let Ok(_) = import_snapmagic(&event.paths[0], &config) else {
-                            continue;
-                        };
-                    }
+        Commands::Retry { id, dry_run } => {
+            let record = storage::records()?
+                .into_iter()
+                .find(|r| r.id == id)
+                .context("unknown import ID; run uniloader pending")?;
+            let hash = storage::source_hash(&record.source)?;
+            if hash != record.hash {
+                bail!(
+                    "source changed since queued; use `uniloader import` to review it as a new component"
+                );
+            }
+            execute(
+                &cfg,
+                &Request {
+                    dry_run,
+                    noninteractive: cli.noninteractive,
+                    force: true,
+                    ..Request::default()
+                },
+                record,
+                &mut Session::default(),
+            )
+        }
+        Commands::Discover => {
+            let p = desktop::projects();
+            if p.is_empty() {
+                println!("No project suggestions found. Browse or use --project.");
+            } else {
+                for path in p {
+                    println!("{} (process suggestion)", path.display());
                 }
             }
-            Err(e) => println!("watch error: {:?}", e),
+            Ok(())
         }
     }
-
-    Ok(())
-}
-
-fn validate_zip(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("zip"))
-            .unwrap_or(false)
-}
-
-fn find_source_type(path: &Path) -> Result<SourceType, SourceError> {
-    let name = path
-        .file_name()
-        .ok_or(SourceError::FilenameError)?
-        .to_str()
-        .ok_or(SourceError::FilenameError)?;
-
-    if name.starts_with("LIB_") {
-        return Ok(SourceType::SymacSys);
-    } else if name.starts_with("ul_") {
-        return Ok(SourceType::UltraLibrarian);
-    }
-
-    let file = File::open(path).map_err(|_| SourceError::SourceUnknown)?;
-    let mut archive = ZipArchive::new(file).map_err(|_| SourceError::SourceUnknown)?;
-    for i in 0..archive.len() {
-        let Ok(mut file) = archive.by_index(i) else {
-            continue;
-        };
-        let name = file.name();
-
-        if name.to_lowercase().contains("how-to-import") {
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)
-                .map_err(|_| SourceError::SourceUnknown)?;
-
-            if contents.to_lowercase().contains("snapeda") {
-                return Ok(SourceType::SnapMagic);
-            }
-        }
-    }
-    Err(SourceError::SourceUnknown)
-}
-
-fn extract_zip(path: &Path, config: &Config) -> Result<PathBuf, ImportError> {
-    let file = File::open(path).map_err(|_| ImportError::InvalidPath)?;
-    let mut archive = ZipArchive::new(file).map_err(|_| ImportError::InvalidZip)?;
-
-    let Some(file_name) = path.file_stem() else {
-        return Err(ImportError::InvalidPath);
-    };
-
-    let tmp_path = config.libraries.path.join("tmp").join(file_name);
-
-    fs::create_dir_all(&tmp_path).map_err(|_| ImportError::InvalidPath)?;
-
-    archive
-        .extract(&tmp_path)
-        .map_err(|_| ImportError::InvalidPath)?;
-
-    fs::remove_file(path).map_err(|_| ImportError::InvalidPath)?;
-    Ok(tmp_path)
-}
-
-fn import_symacsys(path: &Path, config: &Config) -> Result<(), ImportError> {
-    let tmp_path = extract_zip(path, config)?;
-
-    let data_dir = fs::read_dir(&tmp_path)
-        .map_err(|_| ImportError::InvalidPath)?
-        .filter_map(|e| e.ok())
-        .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|entry| entry.path())
-        .ok_or(ImportError::InvalidPath)?;
-
-    let kicad_dir = data_dir.join("KiCad");
-
-    let entries = fs::read_dir(&kicad_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let sym_files: Vec<PathBuf> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_sym")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let mod_files: Vec<PathBuf> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_mod")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let root = config.libraries.path.join("SymacSys");
-    let sym = root.join("SymacSys_Components.kicad_sym");
-    let pretty = root.join("SymacSys_Footprints.pretty");
-
-    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
-
-    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
-    Ok(())
-}
-
-fn import_ultralibrarian(path: &Path, config: &Config) -> Result<(), ImportError> {
-    let tmp_path = extract_zip(path, config)?;
-
-    let data_dir = fs::read_dir(&tmp_path)
-        .map_err(|_| ImportError::InvalidPath)?
-        .filter_map(|e| e.ok())
-        .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|entry| entry.path())
-        .ok_or(ImportError::InvalidPath)?;
-
-    let pretty_dir = data_dir.join("footprints.pretty");
-
-    let root_entries = fs::read_dir(&data_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let pretty_entries = fs::read_dir(&pretty_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let sym_files: Vec<PathBuf> = root_entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_sym")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let mod_files: Vec<PathBuf> = pretty_entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_mod")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let root = config.libraries.path.join("UltraLibrarian");
-    let sym = root.join("UltraLibrarian_Components.kicad_sym");
-    let pretty = root.join("UltraLibrarian_Footprints.pretty");
-
-    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
-
-    fs::remove_dir_all(tmp_path).map_err(|_| ImportError::InvalidPath)?;
-    Ok(())
-}
-
-fn import_snapmagic(path: &Path, config: &Config) -> Result<(), ImportError> {
-    let data_dir = extract_zip(path, config)?;
-
-    let entries = fs::read_dir(&data_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    let sym_files: Vec<PathBuf> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_sym")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let mod_files: Vec<PathBuf> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .map(|e| e == "kicad_mod")
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    let root = config.libraries.path.join("SnapMagic");
-    let sym = root.join("SnapMagic_components.kicad_sym");
-    let pretty = root.join("SnapMagic_Footprints.pretty");
-
-    install_library(sym_files, mod_files, &root, &sym, &pretty, config)?;
-
-    fs::remove_dir_all(data_dir).map_err(|_| ImportError::InvalidPath)?;
-    Ok(())
-}
-
-fn install_library(
-    sym_files: Vec<PathBuf>,
-    mod_files: Vec<PathBuf>,
-    lib_root: &Path,
-    sym_file: &Path,
-    pretty_dir: &Path,
-    config: &Config,
-) -> Result<(), ImportError> {
-    let symbols = config
-        .options
-        .as_ref()
-        .and_then(|o| o.symbols)
-        .unwrap_or(true);
-    let footprints = config
-        .options
-        .as_ref()
-        .and_then(|o| o.footprints)
-        .unwrap_or(true);
-
-    fs::create_dir_all(lib_root).map_err(|_| ImportError::InvalidPath)?;
-    fs::create_dir_all(pretty_dir).map_err(|_| ImportError::InvalidPath)?;
-
-    if symbols {
-        // Load or create symbol library
-        let mut current_lib = if sym_file.exists() {
-            let contents = fs::read_to_string(sym_file).map_err(|_| ImportError::InvalidPath)?;
-            SymbolLibrary::from_str(&contents)
-        } else {
-            SymbolLibrary::new()
-        };
-
-        // Install symbols
-        for sym_path in sym_files {
-            let sym_str = fs::read_to_string(&sym_path).map_err(|_| ImportError::InvalidPath)?;
-            let new_lib = SymbolLibrary::from_str(&sym_str);
-
-            for symbol in new_lib.symbols {
-                if !current_lib.symbols.iter().any(|s| s.name == symbol.name) {
-                    current_lib.symbols.push(symbol);
-                }
-            }
-        }
-
-        if !current_lib.symbols.is_empty() {
-            let output = current_lib.write();
-            fs::write(sym_file, output).map_err(|_| ImportError::InvalidPath)?;
-        }
-    }
-
-    if footprints {
-        // Install footprints
-        for mod_path in mod_files {
-            let filename = mod_path.file_name().ok_or(ImportError::InvalidPath)?;
-            let target = pretty_dir.join(filename);
-            fs::copy(mod_path, target).map_err(|_| ImportError::InvalidPath)?;
-        }
-    }
-
-    Ok(())
 }

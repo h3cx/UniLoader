@@ -1,36 +1,76 @@
 # UniLoader
 
-A simple daemon that automatically imports any libraries into KiCad. It currently supports symbols and footprints from [SamacSys](https://componentsearchengine.com/), [UltraLibrarian](https://app.ultralibrarian.com/search), [SnapMagic](https://www.snapeda.com/home/)
+UniLoader imports KiCad components from downloaded ZIPs or extracted folders,
+including [SamacSys](https://componentsearchengine.com/),
+[UltraLibrarian](https://app.ultralibrarian.com/search) and
+[SnapMagic](https://www.snapeda.com/home/). Run it manually or watch your download
+folder throughout your graphical login session.
 
-## Installation
+It supports symbols, footprints and referenced STEP/VRML models, with:
 
-An automated install script is planned but currently the repo needs to be cloned, built and installed manually.
+- Global libraries or portable project-local libraries, created and registered automatically.
+- A destination dialog offering detected KiCad project suggestions, Global and Browse.
+- Conservative exact footprint reuse and comparison dialogs for uncertain matches.
+- Broken model-path repair, explicit ambiguous model choices and missing-model warnings.
+- Preserved source archives, pending import retries, backups and import history.
+
+## Quick start
+
+Linux requires Rust 1.95 or newer and the usual
+desktop graphics libraries. The binary includes egui/eframe dialogs; rfd file
+browsing uses the desktop's XDG portal. `notify-send` is optional. See the
+[setup guide](docs/SETUP.md) for packages, configuration, recovery and the shipped
+[systemd user service](systemd/uniloader.service).
+
+```sh
+cargo build --release --locked
+install -Dm755 target/release/uniloader ~/.local/bin/uniloader
+~/.local/bin/uniloader import /path/to/component.zip --project /path/to/Board/Board.kicad_pro --dry-run
+~/.local/bin/uniloader import /path/to/component.zip --project /path/to/Board/Board.kicad_pro
+~/.local/bin/uniloader watch
 ```
-git clone https://git.h3cx.dev/h3cx/UniLoader.git
 
-cd UniLoader
+A default configuration is generated on first launch at
+`${XDG_CONFIG_HOME:-~/.config}/uniloader/config.toml`. The existing minimal config
+remains supported:
 
-cargo build -r
-```
-You will then find the binary under `target/release` you can run it manually or create a systemd service to automatically run it at boot.
-
-## Usage
-
-To get started you will need to set up your config, to do so create a config file. A full config file can be found in the config folder of this repo.
-```
-mkdir ~/.config/uniloader
-
-touch ~/.config/uniloader/config.toml
-```
-Then use your favorite text editor to open this config and paste in the minimal config.
-```
+```toml
 [libraries]
-path = "~/KiCad/libraries/"
+path = "~/KiCad/libraries"
+# For global imports, choose your actual installed KiCad version if detection
+# finds none or more than one:
+# kicad_config = "~/.config/kicad/9.0"
 ```
-Now that you have set this up, the application should be ready to go, just head over to your favorite library website and download any component.
 
-Upon downloading the first component from a given online library you will be required to add the library to KiCad. In KiCad open your symbol editor and head to `File->Add Library` then naviagate to the path you set in your config and add the library. Repeat this from the footprint editor for the footprints libraries.
+See [the complete configuration example](config/config_full.toml). Project
+imports create libraries beside the `.kicad_pro` file using `${KIPRJMOD}` paths;
+KiCad may need a library refresh or reopen. Missing models are reported and mean
+that a component is not yet fully portable.
+
+```sh
+uniloader import /path/to/component.zip --global
+uniloader import /path/to/extracted-folder --project /path/to/Board/Board.kicad_pro
+uniloader pending
+uniloader retry IMPORT_ID
+uniloader discover
+```
+
+No-argument startup also runs the watcher. `--noninteractive` leaves unresolved
+choices pending; `--force` on manual imports deliberately revisits a completed
+source. Check an imported component in KiCad before using it in a board.
+
+## Scope
+
+This is practical Linux development tooling. Project discovery currently uses
+process arguments and working directories as suggestions; check the selected
+path. KiCad IPC discovery, tray controls, comparison overlays and automatic undo
+are follow-ups. Legacy `.lib` conversion and CAD-format conversion are outside
+the current release. The preview is approximate; inspect unusual footprints in
+KiCad. The [specification](SPEC.md) records the intended behavior and delivery
+priorities.
 
 ## Warranty
 
-Use this program at your own risk, no warranty is provided for anything that it could do to your libraries, KiCad or operating system. If you encounter any issues feel free to open an issue.
+Use this program at your own risk, no warranty is provided for anything that it
+could do to your libraries, KiCad or operating system. If you encounter any issues
+feel free to open an issue. Licensed under [GPL-3.0-or-later](LICENSE).
