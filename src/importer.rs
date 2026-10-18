@@ -431,13 +431,13 @@ pub fn run(cfg: &Config, req: &Request, record: &mut Record, session: &mut Sessi
     let (fp_table, fp_nickname) = destination::register_table(
         text(&dest.table_dir.join("fp-lib-table"))?.as_deref(),
         "fp_lib_table",
-        "UniLoader",
+        dest.nickname(),
         &dest.footprint_uri(),
     )?;
     let (sym_table, sym_nickname) = destination::register_table(
         text(&dest.table_dir.join("sym-lib-table"))?.as_deref(),
         "sym_lib_table",
-        "UniLoader",
+        dest.nickname(),
         &dest.symbol_uri(),
     )?;
     let mut library_index = index(cfg, &dest, &kicad, &vars, &fp_nickname)

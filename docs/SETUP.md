@@ -152,7 +152,9 @@ Use `--noninteractive` to avoid opening dialogs. A pending choice is not consent
 Project imports create `libraries/UniLoader.kicad_sym`,
 `libraries/UniLoader.pretty/`, and model storage as needed, and merge registration
 entries into `sym-lib-table` and `fp-lib-table` beside the `.kicad_pro` file.
-Project paths use `${KIPRJMOD}`. Portable mode copies selected external footprints
+Project registration uses the nickname `UniLoader_Local`; global registration uses
+`UniLoader_Global`. Library filenames remain `UniLoader.kicad_sym` and
+`UniLoader.pretty` in both scopes. Project paths use `${KIPRJMOD}`. Portable mode copies selected external footprints
 and available referenced models into the project. Global imports use the
 configured library root and register entries in the selected KiCad configuration.
 Existing unrelated table entries are preserved. Existing schematic and PCB
@@ -169,6 +171,49 @@ UltraLibrarian and SnapMagic layouts); use a manual folder import for extracted
 assets. Source archives are preserved by default. Incomplete or invalid ZIPs
 are retried for the configured period, then remain recoverable rather than
 stopping subsequent downloads.
+
+## Nickname migration (v0.2.2)
+
+Before upgrading existing libraries, close KiCad and stop the watcher:
+
+```sh
+systemctl --user stop uniloader.service
+uniloader doctor --global
+uniloader doctor --global --fix
+uniloader doctor --project /path/to/Board/Board.kicad_pro
+uniloader doctor --project /path/to/Board/Board.kicad_pro --fix
+systemctl --user start uniloader.service
+```
+
+Without `--fix`, doctor previews the files it would change. `--global` checks the
+configured global tables and managed symbol library. `--project` checks those
+plus the selected project's tables, managed symbol library, and `.kicad_sch` and
+`.kicad_pcb` files recursively inside its directory (including subsheets). Run it
+for every existing project; projects elsewhere are not automatically discovered
+or modified. External subsheets must be migrated separately. Set
+`libraries.kicad_config` to the correct version directory when needed.
+
+Doctor identifies managed registrations by their resolved library paths, preserves
+unrelated registrations and metadata, and refuses an occupied target nickname.
+It updates symbol footprint properties, schematic library IDs and cached symbol
+IDs, and placed PCB footprint IDs according to the original project-over-global
+resolution. An old ambiguous ID keeps that original resolution; doctor cannot
+recover a different intended library. Asset filenames and model paths stay the
+same. Changed S-expression files are reserialized, so whitespace may change.
+
+Repairs use the import writer lock, atomic file replacement, and the normal
+backup/history mechanism. The command prints backup paths under
+`${XDG_DATA_HOME:-~/.local/share}/uniloader/backups/`; `uniloader pending --all`
+also lists changed files and backups. Exact old nicknames (including collision
+suffixes) are retained under `uniloader/nickname-migrations/` in the same data
+root so later project repairs can update global references. Keep this migration
+history until all projects are repaired. Repeated repairs leave unchanged files
+alone. All files are parsed and collisions checked before writing, but a disk
+failure can still interrupt a multi-file repair; restore the listed backups if
+needed. Reopen KiCad after repair to reload its cached tables.
+
+Imports into a destination still using an old managed nickname stop with a doctor
+instruction. Repair that destination before resuming imports.
 
 ## 3D models and broken paths
 

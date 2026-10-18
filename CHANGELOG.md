@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Use `UniLoader_Global` and `UniLoader_Local` nicknames for global and project libraries, preventing project entries from shadowing global managed libraries.
+- Keep existing asset filenames and portable paths unchanged.
+- Add `doctor --global` and `doctor --project FILE` to preview nickname repairs; `--fix` backs up and migrates registrations, managed symbol bindings, and project schematic/PCB references.
+- Preserve unrelated registrations, reject occupied target nicknames before writes, and retain exact legacy nickname mappings for later project migrations.
+- Stop imports using legacy managed nicknames with instructions to run doctor.
+
+Validation: 62 automated tests, Clippy, formatting, and release build passed. Live KiCad integration requires manual verification.
+
 ## 0.2.1
 
 - Fix high idle watcher CPU usage caused by directory scans generating filesystem open events and triggering further scans.

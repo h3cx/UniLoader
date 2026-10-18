@@ -3,6 +3,7 @@
 mod config;
 mod desktop;
 mod destination;
+mod doctor;
 mod gui;
 mod importer;
 mod matching;
@@ -73,6 +74,15 @@ enum Commands {
         id: String,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Check managed nicknames; --fix backs up and migrates libraries/references.
+    Doctor {
+        #[arg(long, required_unless_present = "project", conflicts_with = "project")]
+        global: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        fix: bool,
     },
     /// Show project suggestions from running KiCad processes.
     Discover,
@@ -392,6 +402,11 @@ fn main() -> Result<()> {
                 &mut Session::default(),
             )
         }
+        Commands::Doctor {
+            global: _,
+            project,
+            fix,
+        } => doctor::run(&cfg, project.as_deref(), fix),
         Commands::Discover => {
             let p = desktop::projects();
             if p.is_empty() {
