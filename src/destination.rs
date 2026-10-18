@@ -66,6 +66,13 @@ impl Destination {
         }
         Ok(result)
     }
+    pub fn nickname(&self) -> &'static str {
+        if self.project.is_some() {
+            "UniLoader_Local"
+        } else {
+            "UniLoader_Global"
+        }
+    }
     fn uri(&self, path: &Path) -> String {
         if let Some(project) = &self.project
             && let Ok(relative) = path.strip_prefix(project)
@@ -144,6 +151,9 @@ pub fn register_table(
             .then(|| field_value(entry, "name").map(str::to_owned))
             .flatten()
     }) {
+        if requested_nickname.starts_with("UniLoader_") && !name.starts_with(requested_nickname) {
+            bail!("Legacy managed library nickname {name}; run `uniloader doctor --global --fix` or `uniloader doctor --project /path/to/Board.kicad_pro --fix` before importing");
+        }
         return Ok((format!("{table}\n"), name));
     }
     let mut nickname = requested_nickname.to_owned();

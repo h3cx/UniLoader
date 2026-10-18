@@ -8,7 +8,7 @@ folder throughout your graphical login session.
 
 It supports symbols, footprints and referenced STEP/VRML models, with:
 
-- Global libraries or portable project-local libraries, created and registered automatically.
+- Global (`UniLoader_Global`) and project-local (`UniLoader_Local`) library nicknames, created and registered automatically.
 - A destination dialog offering detected KiCad project suggestions, Global and Browse.
 - Conservative exact footprint reuse and comparison dialogs for uncertain matches.
 - Broken model-path repair, explicit ambiguous model choices and missing-model warnings.
@@ -58,6 +58,22 @@ uniloader discover
 No-argument startup also runs the watcher. `--noninteractive` leaves unresolved
 choices pending; `--force` on manual imports deliberately revisits a completed
 source. Check an imported component in KiCad before using it in a board.
+
+## Upgrade existing libraries to v0.2.2
+
+Close KiCad and stop the watcher, then preview and apply the nickname migration:
+
+```sh
+uniloader doctor --global
+uniloader doctor --global --fix
+uniloader doctor --project /path/to/Board/Board.kicad_pro
+uniloader doctor --project /path/to/Board/Board.kicad_pro --fix
+```
+
+Repeat the project commands for each existing project. Project repair also checks
+and repairs the configured global libraries. Existing library filenames stay the
+same. Changed files are backed up; see the [setup guide](docs/SETUP.md#nickname-migration-v022)
+for migration scope and recovery. Reopen KiCad afterwards.
 
 ## Scope
 

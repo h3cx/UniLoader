@@ -180,7 +180,7 @@ fn imports_three_provider_layouts_and_preserves_original_archives() {
         assert!(source.is_file());
         assert_eq!(h.footprints().len(), 1);
         let lib = h.library();
-        assert_eq!(link(symbols(&lib)[0]), "UniLoader:Package");
+        assert_eq!(link(symbols(&lib)[0]), "UniLoader_Local:Package");
         assert!(lib.to_string().contains("µ Ω (quoted)"));
         assert_eq!(lib.field("version").unwrap().value(), Some("20231120"));
     }
@@ -208,7 +208,11 @@ fn exact_cross_provider_reuse_and_repeat_import_are_idempotent() {
     assert_eq!(h.footprints().len(), 1);
     let lib = h.library();
     assert_eq!(symbols(&lib).len(), 2);
-    assert!(symbols(&lib).iter().all(|s| link(s) == "UniLoader:PkgA"));
+    assert!(
+        symbols(&lib)
+            .iter()
+            .all(|s| link(s) == "UniLoader_Local:PkgA")
+    );
     ok(&h.import(&a, &[]));
     ok(&h.import(&b, &["--force"]));
     assert_eq!(symbols(&h.library()).len(), 2);
@@ -257,7 +261,7 @@ fn uncertain_footprints_stay_pending_then_retry_with_separate_policy() {
         .into_iter()
         .find(|s| s.value() == Some("Second"))
         .unwrap();
-    assert!(link(second).starts_with("UniLoader:Package_"));
+    assert!(link(second).starts_with("UniLoader_Local:Package_"));
 }
 
 #[test]
@@ -361,8 +365,8 @@ fn multi_symbol_footprint_bindings_do_not_use_first_footprint_for_all() {
     ok(&h.import(&source, &[]));
     let lib = h.library();
     for (name, expected) in [
-        ("First", "UniLoader:PackageA"),
-        ("Second", "UniLoader:PackageB"),
+        ("First", "UniLoader_Local:PackageA"),
+        ("Second", "UniLoader_Local:PackageB"),
     ] {
         let s = symbols(&lib)
             .into_iter()
@@ -485,7 +489,10 @@ fn portable_project_copies_exact_global_footprint_and_model() {
         .unwrap()
         .collect();
     assert_eq!(copied_models.len(), 1);
-    assert_eq!(link(symbols(&h.library())[0]), "UniLoader:GlobalPackage");
+    assert_eq!(
+        link(symbols(&h.library())[0]),
+        "UniLoader_Local:GlobalPackage"
+    );
 }
 
 fn records(h: &Harness) -> Vec<serde_json::Value> {
@@ -516,11 +523,14 @@ fn symbol_only_global_dependency_is_copied_into_portable_project() {
     ok(&h.cmd(&["import", global.to_str().unwrap(), "--global"]));
     let source = h.bundle(
         "symbol-only",
-        &[("b.kicad_sym", symbol("LocalPart", "UniLoader:Package"))],
+        &[(
+            "b.kicad_sym",
+            symbol("LocalPart", "UniLoader_Global:Package"),
+        )],
     );
     ok(&h.import(&source, &[]));
     assert_eq!(h.footprints().len(), 1);
-    assert_eq!(link(symbols(&h.library())[0]), "UniLoader:Package");
+    assert_eq!(link(symbols(&h.library())[0]), "UniLoader_Local:Package");
     assert!(
         fs::read_to_string(&h.footprints()[0])
             .unwrap()
@@ -603,7 +613,7 @@ fn project_library_and_model_paths_resolve_after_directory_relocation() {
     assert_eq!(fs::read(path).unwrap(), b"RELOCATED MODEL");
     let lib = parse(&fs::read_to_string(relocated.join("libraries/UniLoader.kicad_sym")).unwrap())
         .unwrap();
-    assert_eq!(link(symbols(&lib)[0]), "UniLoader:Package");
+    assert_eq!(link(symbols(&lib)[0]), "UniLoader_Local:Package");
 }
 
 #[test]
@@ -620,7 +630,7 @@ fn disabled_footprint_import_reuses_registered_assets_and_rejects_dangling_links
     append_config(&h, "[options]\nfootprints = false");
     let valid = h.bundle(
         "valid",
-        &[("b.kicad_sym", symbol("Second", "UniLoader:Package"))],
+        &[("b.kicad_sym", symbol("Second", "UniLoader_Local:Package"))],
     );
     ok(&h.import(&valid, &[]));
     let invalid = h.bundle(
@@ -774,7 +784,7 @@ fn disabled_footprints_cannot_reference_an_unregistered_managed_directory() {
         )
         .unwrap();
         assert!(table.children().iter().any(|n| n.head() == Some("lib")
-            && n.field("name").and_then(Node::value) == Some("UniLoader")));
+            && n.field("name").and_then(Node::value) == Some("UniLoader_Local")));
     } else {
         assert!(output(&result).contains("pending"));
         assert!(
@@ -815,4 +825,147 @@ fn qualified_existing_reference_is_not_silently_retargeted_by_bundle_basename() 
     } else {
         assert!(output(&result).contains("pending"));
     }
+}
+
+#[test]
+fn doctor_migrates_both_scopes_and_project_references_with_backups() {
+    let h = Harness::new("separate");
+    let source = h.bundle(
+        "source",
+        &[
+            ("a.kicad_sym", symbol("Part", "Package")),
+            ("Package.kicad_mod", footprint("Package", 1.0, "")),
+        ],
+    );
+    ok(&h.cmd(&["import", source.to_str().unwrap(), "--global"]));
+    ok(&h.import(&source, &[]));
+    // Recreate v0.2.1 registrations and stored footprint bindings.
+    let paths = [
+        "kicad-config/sym-lib-table",
+        "kicad-config/fp-lib-table",
+        "global/UniLoader.kicad_sym",
+        "project/sym-lib-table",
+        "project/fp-lib-table",
+        "project/libraries/UniLoader.kicad_sym",
+    ];
+    for path in paths {
+        let path = h.root.join(path);
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("UniLoader_Global", "UniLoader")
+            .replace("UniLoader_Local", "UniLoader");
+        fs::write(path, text).unwrap();
+    }
+    let sch = h.root.join("project/board.kicad_sch");
+    fs::write(&sch, r#"(kicad_sch (lib_symbols (symbol "UniLoader:Part" (property "Footprint" "UniLoader:Package"))) (symbol (lib_id "UniLoader:Part") (property "Footprint" "UniLoader:Package") (property "Description" "UniLoader:keep")))"#).unwrap();
+    let pcb = h.root.join("project/board.kicad_pcb");
+    fs::write(
+        &pcb,
+        r#"(kicad_pcb (footprint "UniLoader:Package" (property "Value" "keep")))"#,
+    )
+    .unwrap();
+    let before = fs::read(&sch).unwrap();
+    let args = ["doctor", "--project", h.project.to_str().unwrap()];
+    let preview = h.cmd(&args);
+    ok(&preview);
+    assert!(output(&preview).contains("Would repair"));
+    assert_eq!(fs::read(&sch).unwrap(), before);
+    // Imports must not silently retain a legacy registration.
+    let blocked = h.import(&source, &["--force"]);
+    assert!(!blocked.status.success());
+    assert!(output(&blocked).contains("doctor"));
+    let fixed = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
+    ok(&fixed);
+    assert!(output(&fixed).contains("Backup:"));
+    assert!(
+        walkdir::WalkDir::new(h.root.join("xdg-data/uniloader/backups"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_type().is_file() && fs::read(entry.path()).unwrap() == before)
+    );
+    assert!(
+        fs::read_to_string(&sch)
+            .unwrap()
+            .contains("UniLoader_Local:Part")
+    );
+    assert!(fs::read_to_string(&sch).unwrap().contains("UniLoader:keep"));
+    assert!(
+        fs::read_to_string(&pcb)
+            .unwrap()
+            .contains("UniLoader_Local:Package")
+    );
+    assert_eq!(link(symbols(&h.library())[0]), "UniLoader_Local:Package");
+    let global =
+        parse(&fs::read_to_string(h.root.join("global/UniLoader.kicad_sym")).unwrap()).unwrap();
+    assert_eq!(link(symbols(&global)[0]), "UniLoader_Global:Package");
+    let again = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
+    ok(&again);
+    assert!(output(&again).contains("No nickname repairs needed"));
+    ok(&h.import(&source, &["--force"]));
+}
+
+#[test]
+fn doctor_refuses_occupied_nickname_before_writing_anything() {
+    let h = Harness::new("separate");
+    fs::create_dir_all(h.root.join("kicad-config")).unwrap();
+    let table = h.root.join("kicad-config/fp-lib-table");
+    let text = format!(
+        r#"(fp_lib_table (lib (name "UniLoader") (type "KiCad") (uri "{}")) (lib (name "UniLoader_Global") (type "KiCad") (uri "/unrelated.pretty") (options "keep")))"#,
+        h.root.join("global/UniLoader.pretty").display()
+    );
+    fs::write(&table, &text).unwrap();
+    let result = h.cmd(&["doctor", "--global", "--fix"]);
+    assert!(!result.status.success());
+    assert!(output(&result).contains("occupied"));
+    assert_eq!(fs::read_to_string(table).unwrap(), text);
+}
+
+#[test]
+fn doctor_updates_global_references_in_projects_after_global_migration() {
+    let h = Harness::new("separate");
+    let source = h.bundle(
+        "source",
+        &[
+            ("a.kicad_sym", symbol("Part", "Package")),
+            ("Package.kicad_mod", footprint("Package", 1.0, "")),
+        ],
+    );
+    ok(&h.cmd(&["import", source.to_str().unwrap(), "--global"]));
+    for path in [
+        "kicad-config/fp-lib-table",
+        "kicad-config/sym-lib-table",
+        "global/UniLoader.kicad_sym",
+    ] {
+        let path = h.root.join(path);
+        fs::write(
+            &path,
+            fs::read_to_string(&path)
+                .unwrap()
+                .replace("UniLoader_Global", "UniLoader_2"),
+        )
+        .unwrap();
+    }
+    ok(&h.cmd(&["doctor", "--global", "--fix"]));
+    let sch = h.root.join("project/board.kicad_sch");
+    let text = r#"(kicad_sch (symbol (lib_id "UniLoader_2:Part") (property "Footprint" "UniLoader_2:Package")))"#;
+    fs::write(&sch, text).unwrap();
+    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+    assert!(
+        fs::read_to_string(&sch)
+            .unwrap()
+            .contains("UniLoader_Global:Part")
+    );
+    // An unrelated local registration must retain its existing resolution.
+    fs::write(&sch, text).unwrap();
+    fs::write(
+        h.root.join("project/sym-lib-table"),
+        r#"(sym_lib_table (lib (name "UniLoader_2") (type "KiCad") (uri "/unrelated.kicad_sym")))"#,
+    )
+    .unwrap();
+    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+    assert!(
+        fs::read_to_string(&sch)
+            .unwrap()
+            .contains("\"UniLoader_2:Part\"")
+    );
 }

@@ -129,7 +129,7 @@ project/
     models/
 ```
 
-- Add/merge UniLoader entries into the appropriate symbol and footprint tables.
+- Add/merge `UniLoader_Global` or `UniLoader_Local` entries into the appropriate symbol and footprint tables.
   Preserve unrelated entries and never silently repoint an occupied nickname.
 - Project URIs use `${KIPRJMOD}/libraries/...`; global URIs use stable absolute
   paths. Let users select the KiCad configuration/version directory if ambiguous.
