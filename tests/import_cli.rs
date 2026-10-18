@@ -900,7 +900,7 @@ fn doctor_migrates_both_scopes_and_project_references_with_backups() {
     assert_eq!(link(symbols(&global)[0]), "UniLoader_Global:Package");
     let again = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
     ok(&again);
-    assert!(output(&again).contains("No nickname repairs needed"));
+    assert!(output(&again).contains("No automatic repairs needed"));
     ok(&h.import(&source, &["--force"]));
 }
 
@@ -962,10 +962,196 @@ fn doctor_updates_global_references_in_projects_after_global_migration() {
         r#"(sym_lib_table (lib (name "UniLoader_2") (type "KiCad") (uri "/unrelated.kicad_sym")))"#,
     )
     .unwrap();
-    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+    let checked = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
+    assert!(!checked.status.success());
+    assert!(output(&checked).contains("unmanaged paths are not created"));
     assert!(
         fs::read_to_string(&sch)
             .unwrap()
             .contains("\"UniLoader_2:Part\"")
     );
+}
+
+#[test]
+fn doctor_bootstraps_empty_libraries_and_preview_creates_nothing() {
+    let h = Harness::new("separate");
+    let preview = h.cmd(&["doctor", "--global"]);
+    ok(&preview);
+    assert!(output(&preview).contains("Would create directory"));
+    assert!(!h.root.join("global").exists());
+    assert!(!h.root.join("kicad-config").exists());
+    ok(&h.cmd(&["doctor", "--global", "--fix"]));
+    for path in [
+        "global",
+        "global/UniLoader.pretty",
+        "global/models",
+        "kicad-config",
+    ] {
+        assert!(h.root.join(path).is_dir());
+    }
+    let lib =
+        parse(&fs::read_to_string(h.root.join("global/UniLoader.kicad_sym")).unwrap()).unwrap();
+    assert_eq!(lib.head(), Some("kicad_symbol_lib"));
+    assert!(symbols(&lib).is_empty());
+    for file in ["fp-lib-table", "sym-lib-table"] {
+        assert!(
+            fs::read_to_string(h.root.join("kicad-config").join(file))
+                .unwrap()
+                .contains("UniLoader_Global")
+        );
+    }
+    let again = h.cmd(&["doctor", "--global", "--fix"]);
+    ok(&again);
+    assert!(output(&again).contains("No automatic repairs needed"));
+}
+
+#[test]
+fn doctor_rebuilds_deleted_global_and_project_libraries_and_reports_lost_parts() {
+    let h = Harness::new("separate");
+    let source = h.bundle(
+        "source",
+        &[
+            ("a.kicad_sym", symbol("Part", "Package")),
+            ("Package.kicad_mod", footprint("Package", 1.0, "")),
+        ],
+    );
+    ok(&h.cmd(&["import", source.to_str().unwrap(), "--global"]));
+    ok(&h.import(&source, &[]));
+    let sch = h.root.join("project/board.kicad_sch");
+    fs::write(&sch, r#"(kicad_sch (symbol (lib_id "UniLoader_Global:Part") (property "Footprint" "UniLoader_Local:Package")))"#).unwrap();
+    fs::remove_dir_all(h.root.join("global")).unwrap();
+    fs::remove_dir_all(h.root.join("kicad-config")).unwrap();
+    fs::remove_dir_all(h.root.join("project/libraries")).unwrap();
+    fs::remove_file(h.root.join("project/fp-lib-table")).unwrap();
+    let preview = h.cmd(&["doctor", "--project", h.project.to_str().unwrap()]);
+    assert!(!preview.status.success());
+    assert!(output(&preview).contains("missing symbol UniLoader_Global:Part"));
+    assert!(!h.root.join("global").exists());
+    let fixed = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
+    assert!(!fixed.status.success());
+    assert!(output(&fixed).contains("safe repairs applied"));
+    for root in ["global", "project/libraries"] {
+        assert!(h.root.join(root).join("UniLoader.pretty").is_dir());
+        assert!(h.root.join(root).join("models").is_dir());
+        let lib =
+            parse(&fs::read_to_string(h.root.join(root).join("UniLoader.kicad_sym")).unwrap())
+                .unwrap();
+        assert_eq!(lib.head(), Some("kicad_symbol_lib"));
+        assert!(symbols(&lib).is_empty());
+    }
+    ok(&h.cmd(&["import", source.to_str().unwrap(), "--global", "--force"]));
+    ok(&h.import(&source, &["--force"]));
+    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+}
+
+#[test]
+fn doctor_repairs_owned_stale_paths_disabled_entries_and_types() {
+    let h = Harness::new("separate");
+    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+    for dir in ["kicad-config", "project"] {
+        for file in ["sym-lib-table", "fp-lib-table"] {
+            let path = h.root.join(dir).join(file);
+            let mut table = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            let entry = table.field_mut("lib").unwrap();
+            entry.field_mut("uri").unwrap().children_mut()[1] =
+                Node::string("${DELETED_ROOT}/obsolete");
+            entry.field_mut("type").unwrap().children_mut()[1] = Node::string("Legacy");
+            entry.children_mut().push(parse("(disabled)").unwrap());
+            entry
+                .children_mut()
+                .push(parse("(future_metadata \"keep\")").unwrap());
+            fs::write(path, table.to_string()).unwrap();
+        }
+    }
+    let preview = h.cmd(&["doctor", "--project", h.project.to_str().unwrap()]);
+    ok(&preview);
+    assert!(
+        fs::read_to_string(h.root.join("project/fp-lib-table"))
+            .unwrap()
+            .contains("DELETED_ROOT")
+    );
+    ok(&h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]));
+    for dir in ["kicad-config", "project"] {
+        for file in ["sym-lib-table", "fp-lib-table"] {
+            let text = fs::read_to_string(h.root.join(dir).join(file)).unwrap();
+            assert!(!text.contains("DELETED_ROOT"));
+            assert!(!text.contains("disabled"));
+            assert!(text.contains("KiCad"));
+            assert!(text.contains("future_metadata"));
+            if dir == "project" {
+                assert!(text.contains("${KIPRJMOD}/libraries/"));
+            }
+        }
+    }
+}
+
+#[test]
+fn doctor_detects_deleted_footprints_and_repairs_models_without_guessing() {
+    let h = Harness::new("separate");
+    ok(&h.cmd(&["doctor", "--global", "--fix"]));
+    let fp = h.root.join("global/UniLoader.pretty/Package.kicad_mod");
+    let original = footprint(
+        "Package",
+        1.0,
+        r#"(model "C:\obsolete\part.step" (offset (xyz 1 2 3)))"#,
+    );
+    fs::write(&fp, &original).unwrap();
+    fs::write(h.root.join("global/models/part.step"), "RECOVERED MODEL").unwrap();
+    ok(&h.cmd(&["doctor", "--global"]));
+    assert_eq!(fs::read_to_string(&fp).unwrap(), original);
+    ok(&h.cmd(&["doctor", "--global", "--fix"]));
+    let repaired = parse(&fs::read_to_string(&fp).unwrap()).unwrap();
+    assert_eq!(
+        repaired
+            .field("model")
+            .unwrap()
+            .field("offset")
+            .unwrap()
+            .field("xyz")
+            .unwrap()
+            .children()[1]
+            .atom(),
+        Some("1")
+    );
+    assert!(Path::new(repaired.field("model").unwrap().value().unwrap()).is_file());
+    // Competing model files are reported; no arbitrary candidate is selected.
+    fs::write(&fp, &original).unwrap();
+    fs::create_dir_all(h.root.join("global/other")).unwrap();
+    fs::write(h.root.join("global/other/part.step"), "DIFFERENT MODEL").unwrap();
+    let ambiguous = h.cmd(&["doctor", "--global", "--fix"]);
+    assert!(!ambiguous.status.success());
+    assert!(output(&ambiguous).contains("ambiguous model"));
+    assert_eq!(fs::read_to_string(&fp).unwrap(), original);
+    fs::remove_dir_all(h.root.join("global/other")).unwrap();
+    fs::remove_file(h.root.join("global/models/part.step")).unwrap();
+    let missing = h.cmd(&["doctor", "--global", "--fix"]);
+    assert!(!missing.status.success());
+    assert!(output(&missing).contains("Missing model"));
+    assert_eq!(fs::read_to_string(&fp).unwrap(), original);
+    fs::write(
+        h.root.join("global/UniLoader.kicad_sym"),
+        symbol("Part", "UniLoader_Global:Package"),
+    )
+    .unwrap();
+    fs::remove_dir_all(h.root.join("global/UniLoader.pretty")).unwrap();
+    let deleted = h.cmd(&["doctor", "--global", "--fix"]);
+    assert!(!deleted.status.success());
+    assert!(output(&deleted).contains("missing footprint UniLoader_Global:Package"));
+    assert!(h.root.join("global/UniLoader.pretty").is_dir());
+}
+
+#[test]
+fn doctor_does_not_overwrite_corrupt_libraries_or_partially_apply_a_failed_plan() {
+    let h = Harness::new("separate");
+    fs::create_dir_all(h.root.join("project/libraries")).unwrap();
+    let bad = h.root.join("project/libraries/UniLoader.kicad_sym");
+    fs::write(&bad, "(kicad_symbol_lib (broken").unwrap();
+    let result = h.cmd(&["doctor", "--project", h.project.to_str().unwrap(), "--fix"]);
+    assert!(!result.status.success());
+    assert_eq!(
+        fs::read_to_string(bad).unwrap(),
+        "(kicad_symbol_lib (broken"
+    );
+    assert!(!h.root.join("global").exists());
+    assert!(!h.root.join("kicad-config").exists());
 }

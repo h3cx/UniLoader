@@ -172,9 +172,12 @@ assets. Source archives are preserved by default. Incomplete or invalid ZIPs
 are retried for the configured period, then remain recoverable rather than
 stopping subsequent downloads.
 
-## Nickname migration (v0.2.2)
+## Library health and repair (v0.2.3)
 
-Before upgrading existing libraries, close KiCad and stop the watcher:
+Doctor includes the v0.2.2 nickname migration and now checks and rebuilds managed
+library infrastructure, including when the global library root has been deleted.
+
+Before applying repairs, close KiCad and stop the watcher:
 
 ```sh
 systemctl --user stop uniloader.service
@@ -185,21 +188,56 @@ uniloader doctor --project /path/to/Board/Board.kicad_pro --fix
 systemctl --user start uniloader.service
 ```
 
-Without `--fix`, doctor previews the files it would change. `--global` checks the
-configured global tables and managed symbol library. `--project` checks those
-plus the selected project's tables, managed symbol library, and `.kicad_sch` and
-`.kicad_pcb` files recursively inside its directory (including subsheets). Run it
-for every existing project; projects elsewhere are not automatically discovered
-or modified. External subsheets must be migrated separately. Set
-`libraries.kicad_config` to the correct version directory when needed.
+Without `--fix`, doctor previews directories and files it would create or repair.
+`--global` checks the configured global tables, managed symbol library and managed
+footprints/models. `--project` checks those plus the selected project's libraries,
+tables, and `.kicad_sch` and `.kicad_pcb` files recursively inside its directory
+(including subsheets). Run it for every existing project; projects elsewhere are not automatically discovered
+or modified. External subsheets must be checked separately. Set
+`libraries.kicad_config` to the correct version directory when needed: doctor
+requires an explicit or uniquely detected KiCad configuration for both scopes.
 
-Doctor identifies managed registrations by their resolved library paths, preserves
-unrelated registrations and metadata, and refuses an occupied target nickname.
+Doctor recreates missing managed roots, `UniLoader.pretty/` and `models/`
+directories, valid empty `UniLoader.kicad_sym` files, and missing symbol/footprint
+tables or managed entries. Existing malformed managed libraries, tables, duplicate
+aliases, and wrong file/directory types block the repair plan before it is applied;
+corrupt content is not replaced with an empty library.
+
+Doctor identifies managed registrations by their resolved library paths. Stale
+paths can also be repaired when the registration carries the UniLoader nickname
+and `Imported by UniLoader` description. It points owned entries at the configured
+global root or portable project paths, restores the KiCad type, and enables owned
+entries that were disabled. It preserves unrelated registrations and metadata,
+and refuses an occupied target nickname. An unrelated entry using our nickname
+without ownership evidence is reported for manual resolution.
 It updates symbol footprint properties, schematic library IDs and cached symbol
 IDs, and placed PCB footprint IDs according to the original project-over-global
 resolution. An old ambiguous ID keeps that original resolution; doctor cannot
-recover a different intended library. Asset filenames and model paths stay the
-same. Changed S-expression files are reserialized, so whitespace may change.
+recover a different intended library. Asset filenames stay the same. Managed
+footprints are parsed and their model paths repaired using the same conservative
+candidate matching as import: a unique match or identical-content candidates
+can be copied/reused in managed model storage. Missing or ambiguous models remain
+unchanged and are reported; transforms and embedded model references are kept.
+Changed S-expression files are reserialized, so whitespace may change.
+
+Doctor checks active KiCad registrations for unresolved path variables, missing
+paths, wrong types and readability; validates managed symbol/footprint files; and
+checks managed symbol bindings and project symbol/footprint references against
+the effective global/project registrations and actual components. Missing
+configured footprint/model search roots are reported. Third-party registrations
+are checked but not repointed, recreated or removed. Disabled third-party entries
+and non-KiCad plugins are excluded from reference resolution. It does not audit
+the watcher service or recover component content from download history.
+
+Recreating an empty library restores its structure, not deleted symbols,
+footprints or models. Restore those from your backups or deliberately reimport
+the original component with `uniloader import SOURCE --global --force` (or
+`--project FILE --force`). A normal import may skip a previously completed source.
+Doctor reports remaining missing components and models rather than fabricating
+placeholders. It exits nonzero for unresolved findings, including when `--fix`
+has successfully applied the safe portion of the plan. Preview also exits nonzero
+for unresolved findings. No unresolved findings means only that the checked
+scope passed, not that missing historical components were recovered.
 
 Repairs use the import writer lock, atomic file replacement, and the normal
 backup/history mechanism. The command prints backup paths under

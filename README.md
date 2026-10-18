@@ -59,9 +59,9 @@ No-argument startup also runs the watcher. `--noninteractive` leaves unresolved
 choices pending; `--force` on manual imports deliberately revisits a completed
 source. Check an imported component in KiCad before using it in a board.
 
-## Upgrade existing libraries to v0.2.2
+## Check and repair libraries (v0.2.3)
 
-Close KiCad and stop the watcher, then preview and apply the nickname migration:
+Close KiCad and stop the watcher, then preview and apply repairs:
 
 ```sh
 uniloader doctor --global
@@ -71,9 +71,14 @@ uniloader doctor --project /path/to/Board/Board.kicad_pro --fix
 ```
 
 Repeat the project commands for each existing project. Project repair also checks
-and repairs the configured global libraries. Existing library filenames stay the
-same. Changed files are backed up; see the [setup guide](docs/SETUP.md#nickname-migration-v022)
-for migration scope and recovery. Reopen KiCad afterwards.
+and repairs the configured global libraries. Doctor recreates missing managed
+folders, empty symbol libraries and table entries, repairs owned registration
+paths and nicknames, and checks component and model references. It repairs model
+paths when a unique matching file is available. Deleted components require
+restoring or reimporting with `--force`; doctor reports unresolved issues and
+exits nonzero, including after applying safe repairs. Changed files are backed
+up; see the [setup guide](docs/SETUP.md#library-health-and-repair-v023).
+Reopen KiCad afterwards.
 
 ## Scope
 
