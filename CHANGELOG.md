@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+- Expand doctor from nickname migration to managed library health checks and repair.
+- Recreate missing global/project library roots, footprint/model directories, valid empty symbol libraries, tables and managed registrations.
+- Repair stale owned registration paths, wrong KiCad types and disabled owned entries, while preserving unrelated registrations.
+- Validate managed files, check registered paths and project/component references, and repair model paths using conservative import matching.
+- Report unresolved missing components, models and search paths with a nonzero exit status after safe repairs; never invent deleted component content or overwrite corrupt libraries.
+- Preserve preview, backups, nickname migration history and idempotent repairs.
+
+Validation: 67 automated tests, Clippy, formatting, and release build passed. Live KiCad integration requires manual verification.
+
 ## 0.2.2
 
 - Use `UniLoader_Global` and `UniLoader_Local` nicknames for global and project libraries, preventing project entries from shadowing global managed libraries.

@@ -156,7 +156,7 @@ fn target(
         }
     }
 }
-fn variables(cfg: &Config, kicad: &Path) -> BTreeMap<String, String> {
+pub(crate) fn variables(cfg: &Config, kicad: &Path) -> BTreeMap<String, String> {
     let mut vars = cfg.libraries.variables.clone();
     if let Some(version) = kicad
         .file_name()

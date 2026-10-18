@@ -1,4 +1,5 @@
-//! Explicit, backed-up migration of managed library registrations and references.
+//! Backed-up repair and health checks for managed KiCad libraries.
+mod checks;
 use crate::{
     config::Config,
     destination::{self, Destination},
@@ -18,10 +19,11 @@ fn table(dest: &Destination, kind: &str, vars: &Renames, plan: &mut Plan) -> Res
         ("fp-lib-table", &dest.pretty_dir)
     };
     let path = dest.table_dir.join(file);
-    if !path.exists() {
-        return Ok(Renames::new());
-    }
-    let original = fs::read_to_string(&path)?;
+    let original = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        format!("({kind} (version 7))")
+    };
     let mut node = parse(&original)?;
     if node.head() != Some(kind) {
         bail!("Invalid table {}", path.display());
@@ -51,6 +53,7 @@ fn table(dest: &Destination, kind: &str, vars: &Renames, plan: &mut Plan) -> Res
             bail!("Duplicate nickname {name} in {}", path.display());
         }
     }
+    let mut managed = false;
     for entry in node
         .children_mut()
         .iter_mut()
@@ -61,26 +64,50 @@ fn table(dest: &Destination, kind: &str, vars: &Renames, plan: &mut Plan) -> Res
             .and_then(Node::value)
             .context("Library entry missing name")?
             .to_owned();
-        // Only change entries that resolve to our managed file/directory.
         let uri = entry
             .field("uri")
             .and_then(Node::value)
             .context("Library entry missing URI")?;
-        let Ok(resolved) = destination::resolve_variables(uri, dest.project.as_deref(), vars)
-        else {
-            continue;
-        };
-        let resolved = std::path::PathBuf::from(resolved);
-        let resolved = if resolved.is_absolute() {
-            resolved
-        } else {
-            dest.table_dir.join(resolved)
-        };
-        let matches = resolved == *target
-            || (target.exists() && resolved.canonicalize().ok() == target.canonicalize().ok());
-        if !matches || entry.field("type").and_then(Node::value) != Some("KiCad") {
+        let resolved = destination::resolve_variables(uri, dest.project.as_deref(), vars)
+            .ok()
+            .map(std::path::PathBuf::from)
+            .map(|p| {
+                if p.is_absolute() {
+                    p
+                } else {
+                    dest.table_dir.join(p)
+                }
+            });
+        let matches = resolved.as_ref().is_some_and(|p| {
+            p == target || (target.exists() && p.canonicalize().ok() == target.canonicalize().ok())
+        });
+        // A stale path can be rebuilt only with explicit UniLoader ownership.
+        let owned = entry.field("descr").and_then(Node::value) == Some("Imported by UniLoader")
+            && (name == "UniLoader" || name.starts_with("UniLoader_"));
+        if !matches && !owned {
             continue;
         }
+        if managed {
+            bail!(
+                "Multiple managed registrations in {}; resolve duplicate aliases before repair",
+                path.display()
+            );
+        }
+        managed = true;
+        let new_uri = if kind == "sym_lib_table" {
+            dest.symbol_uri()
+        } else {
+            dest.footprint_uri()
+        };
+        entry.field_mut("uri").unwrap().children_mut()[1] = Node::string(new_uri);
+        if let Some(field) = entry.field_mut("type") {
+            *field = parse("(type \"KiCad\")")?;
+        } else {
+            entry.children_mut().push(parse("(type \"KiCad\")")?);
+        }
+        entry
+            .children_mut()
+            .retain(|n| n.head() != Some("disabled"));
         let wanted = dest.nickname();
         if name == wanted
             || name
@@ -106,10 +133,35 @@ fn table(dest: &Destination, kind: &str, vars: &Renames, plan: &mut Plan) -> Res
         history.insert(name.clone(), wanted.into());
         changes.insert(name, wanted.into());
     }
+    if !managed {
+        if occupied.contains_key(dest.nickname()) {
+            bail!(
+                "Nickname {} is occupied in {}; refusing to repoint an unrelated library",
+                dest.nickname(),
+                path.display()
+            );
+        }
+        let uri = if kind == "sym_lib_table" {
+            dest.symbol_uri()
+        } else {
+            dest.footprint_uri()
+        };
+        node = parse(
+            &destination::register_table(Some(&node.to_string()), kind, dest.nickname(), &uri)?.0,
+        )?;
+        changes.extend(
+            history
+                .iter()
+                .filter(|(old, new)| {
+                    new.as_str() == dest.nickname() && !occupied.contains_key(*old)
+                })
+                .map(|(old, new)| (old.clone(), new.clone())),
+        );
+    }
     if history != original_history {
         plan.put(history_path, serde_json::to_vec_pretty(&history)?)?;
     }
-    if node != parse(&original)? {
+    if !path.exists() || node != parse(&original)? {
         plan.put(path, format!("{node}\n").into_bytes())?;
     }
     Ok(changes)
@@ -155,15 +207,15 @@ fn references(node: &mut Node, symbols: &Renames, footprints: &Renames, parent: 
     }
 }
 fn patch(path: &Path, symbols: &Renames, footprints: &Renames, plan: &mut Plan) -> Result<()> {
-    if !path.is_file() {
+    let Some(original) = checks::text(path, plan)? else {
         return Ok(());
-    }
-    let original = fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?;
+    };
     let mut node = parse(&original).with_context(|| format!("Parse {}", path.display()))?;
     let before = node.clone();
     references(&mut node, symbols, footprints, None);
     if node != before {
-        plan.put(path.to_owned(), format!("{node}\n").into_bytes())?;
+        plan.writes
+            .insert(path.to_owned(), format!("{node}\n").into_bytes());
     }
     Ok(())
 }
@@ -186,24 +238,26 @@ fn overlay(dest: &Destination, file: &str, global: &Renames, local: Renames) -> 
 
 pub fn run(cfg: &Config, project: Option<&Path>, fix: bool) -> Result<()> {
     let _lock = Lock::acquire()?;
-    let kicad = importer::kicad_config(cfg, project.is_none())?;
+    let kicad = importer::kicad_config(cfg, true)?;
+    let vars = importer::variables(cfg, &kicad);
     let global = Destination::new(&cfg.libraries.path, None, &kicad)?;
     let mut plan = Plan::default();
-    let sym = table(
-        &global,
-        "sym_lib_table",
-        &cfg.libraries.variables,
-        &mut plan,
-    )?;
-    let fp = table(&global, "fp_lib_table", &cfg.libraries.variables, &mut plan)?;
+    let mut issues = Vec::new();
+    checks::structure(&global, &mut plan)?;
+    let sym = table(&global, "sym_lib_table", &vars, &mut plan)?;
+    let fp = table(&global, "fp_lib_table", &vars, &mut plan)?;
     patch(&global.symbol_path, &sym, &fp, &mut plan)?;
+    checks::footprints(cfg, &global, &vars, &mut plan, &mut issues)?;
+    let mut local_destination = None;
     if let Some(project) = project {
         let local = Destination::new(&cfg.libraries.path, Some(project), &kicad)?;
-        let local_sym = table(&local, "sym_lib_table", &cfg.libraries.variables, &mut plan)?;
-        let local_fp = table(&local, "fp_lib_table", &cfg.libraries.variables, &mut plan)?;
+        checks::structure(&local, &mut plan)?;
+        let local_sym = table(&local, "sym_lib_table", &vars, &mut plan)?;
+        let local_fp = table(&local, "fp_lib_table", &vars, &mut plan)?;
         let sym = overlay(&local, "sym-lib-table", &sym, local_sym)?;
         let fp = overlay(&local, "fp-lib-table", &fp, local_fp)?;
         patch(&local.symbol_path, &sym, &fp, &mut plan)?;
+        checks::footprints(cfg, &local, &vars, &mut plan, &mut issues)?;
         for entry in walkdir::WalkDir::new(local.project.as_ref().unwrap()).follow_links(false) {
             let entry = entry?;
             if entry.file_type().is_file()
@@ -215,6 +269,37 @@ pub fn run(cfg: &Config, project: Option<&Path>, fix: bool) -> Result<()> {
                 patch(entry.path(), &sym, &fp, &mut plan)?;
             }
         }
+        local_destination = Some(local);
+    }
+    checks::audit(
+        &global,
+        local_destination.as_ref(),
+        &vars,
+        &plan,
+        &mut issues,
+    )?;
+    for (label, paths) in [
+        ("footprint search", &cfg.libraries.search_paths),
+        ("model search", &cfg.libraries.model_search_paths),
+    ] {
+        for path in paths {
+            if !path.exists() {
+                issues.push(format!(
+                    "Missing configured {label} path: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    for directory in &plan.directories {
+        println!(
+            "{} directory: {}",
+            if fix { "Create" } else { "Would create" },
+            directory.display()
+        );
+    }
+    for message in &plan.messages {
+        println!("{message}");
     }
     for path in plan.writes.keys() {
         println!(
@@ -223,13 +308,12 @@ pub fn run(cfg: &Config, project: Option<&Path>, fix: bool) -> Result<()> {
             path.display()
         );
     }
-    if plan.writes.is_empty() {
-        println!("No nickname repairs needed.");
+    issues.sort();
+    issues.dedup();
+    if plan.writes.is_empty() && plan.directories.is_empty() {
+        println!("No automatic repairs needed.");
     } else if fix {
-        let mut record = Record::new(
-            global.root.clone(),
-            crate::storage::hash(b"doctor-nicknames"),
-        );
+        let mut record = Record::new(global.root.clone(), crate::storage::hash(b"doctor-health"));
         record.id = format!(
             "doctor-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -237,7 +321,10 @@ pub fn run(cfg: &Config, project: Option<&Path>, fix: bool) -> Result<()> {
         record.status = "importing".into();
         plan.commit(&mut record)?;
         record.status = "completed".into();
-        record.message = "Library nickname migration completed".into();
+        record.message = format!(
+            "Doctor repairs completed; {} unresolved issue(s)",
+            issues.len()
+        );
         record.save()?;
         for backup in record.backups {
             println!("Backup: {}", backup.display());
@@ -248,5 +335,16 @@ pub fn run(cfg: &Config, project: Option<&Path>, fix: bool) -> Result<()> {
     println!(
         "Run doctor --project /path/to/Board.kicad_pro for each existing project. Close KiCad and stop the watcher before --fix; reopen KiCad afterwards."
     );
+    for issue in &issues {
+        eprintln!("Unresolved: {issue}");
+    }
+    if !issues.is_empty() {
+        bail!(
+            "Doctor found {} unresolved issue(s); safe repairs {}. Restore deleted components from backups or reimport with --force where needed",
+            issues.len(),
+            if fix { "applied" } else { "previewed only" }
+        );
+    }
+    println!("No unresolved issues found in the checked scope.");
     Ok(())
 }

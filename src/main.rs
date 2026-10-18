@@ -75,7 +75,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Check managed nicknames; --fix backs up and migrates libraries/references.
+    /// Check libraries and paths; --fix recreates missing managed libraries and repairs references.
     Doctor {
         #[arg(long, required_unless_present = "project", conflicts_with = "project")]
         global: bool,
