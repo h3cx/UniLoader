@@ -124,6 +124,27 @@ fn watcher_handles_partial_and_renamed_downloads_without_blocking_or_reimporting
             .unwrap_or_default()
             .contains("Watching")
     });
+    // Directory scans emit Linux inotify OPEN events themselves. Idle watching
+    // must block instead of repeatedly scanning in response to its own reads.
+    #[cfg(target_os = "linux")]
+    {
+        let runtime = || {
+            fs::read_to_string(format!("/proc/{}/schedstat", watcher.0.id()))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let before = runtime();
+        thread::sleep(Duration::from_secs(1));
+        let cpu = Duration::from_nanos(runtime() - before);
+        assert!(
+            cpu < Duration::from_millis(200),
+            "idle watcher spent {cpu:?} on CPU in one second"
+        );
+    }
     let first = archive("First", 1);
     let second = archive("Independent", 2);
     let third = archive("Renamed", 3);
