@@ -17,7 +17,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::Config;
 use importer::{Request, Session};
-use notify::{RecursiveMode, Watcher};
+use notify::{
+    Event, EventKind, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -141,10 +144,25 @@ fn complete_zip(p: &Path) -> Result<bool> {
     }
     Ok(supported)
 }
+fn event_requires_scan(event: &Event) -> bool {
+    // Reading a watched directory emits OPEN events on Linux, including from
+    // our own scans. Only a writer closing a file can make access relevant.
+    event.need_rescan()
+        || !matches!(event.kind, EventKind::Access(_))
+        || matches!(
+            event.kind,
+            EventKind::Access(AccessKind::Close(AccessMode::Write))
+        )
+}
 fn watch(cfg: Config, noninteractive: bool) -> Result<()> {
     let _watch_lock = storage::Lock::watcher()?;
     let (events_tx, events_rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(events_tx)?;
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+        // Filter before queuing so reads cannot keep the receive loop awake.
+        if event.as_ref().map_or(true, event_requires_scan) {
+            let _ = events_tx.send(event);
+        }
+    })?;
     for dir in &cfg.watch.directories {
         if !dir.is_dir() {
             bail!(
@@ -223,8 +241,19 @@ fn watch(cfg: Config, noninteractive: bool) -> Result<()> {
     let mut last_scan = Instant::now();
     loop {
         match events_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(Ok(_)) => scan(&mut waiting, &seen),
-            Ok(Err(e)) => eprintln!("watch error: {e}"),
+            Ok(event) => {
+                let mut rescan = false;
+                // Bound draining so sustained downloads cannot starve retries.
+                for event in std::iter::once(event).chain(events_rx.try_iter().take(1023)) {
+                    match event {
+                        Ok(_) => rescan = true,
+                        Err(e) => eprintln!("watch error: {e}"),
+                    }
+                }
+                if rescan {
+                    scan(&mut waiting, &seen);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher disconnected"),
         }
@@ -290,6 +319,7 @@ fn watch(cfg: Config, noninteractive: bool) -> Result<()> {
         }
     }
 }
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if matches!(cli.command, Some(Commands::Dialog)) {
@@ -372,6 +402,36 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind};
+
+    #[test]
+    fn scans_changes_and_write_closes_but_ignores_read_access() {
+        for kind in [
+            EventKind::Any,
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            assert!(event_requires_scan(&Event::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            AccessKind::Any,
+            AccessKind::Read,
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Write),
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            let event = Event::new(EventKind::Access(kind));
+            assert!(!event_requires_scan(&event), "{kind:?}");
+            assert!(event_requires_scan(&event.set_flag(Flag::Rescan)));
         }
     }
 }
